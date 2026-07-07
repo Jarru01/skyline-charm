@@ -1,0 +1,49 @@
+name: skyline
+type: charm
+title: Skyline Dashboard
+summary: OpenStack Skyline Dashboard — APIServer + Console (stable/2024.2)
+description: |
+  Deploys the OpenStack Skyline dashboard (stable/2024.2) inside an LXD
+  container.
+
+  The skyline-console wheel is bundled inside the charm (files/ directory)
+  and installed directly — no Node.js, nvm, yarn or webpack build at deploy time.
+
+  Components deployed:
+    - MariaDB (local, optional — skipped when database-url is supplied)
+    - skyline-apiserver (Python ASGI app via gunicorn on 127.0.0.1:28000)
+    - skyline-console  (pre-built Python wheel, served by nginx)
+    - nginx            (public listener on listen-port, default 9999)
+
+  Required before deploy:
+    - keystone-url          full Keystone v3 endpoint URL
+    - system-user-password  password of the skyline OpenStack service user
+    - files/skyline_console-*.whl must be present before charmcraft pack
+    - files/skyline_apiserver must be present before charmcraft pack
+
+bases:
+  - build-on:
+      - name: ubuntu
+        channel: "22.04"
+    run-on:
+      - name: ubuntu
+        channel: "22.04"
+
+requires:
+  db:
+    interface: mysql
+    optional: true
+
+provides:
+  website:
+    interface: http
+
+peers:
+  skyline-peers:
+    interface: skyline-peers
+
+parts:
+  charm:
+    charm-entrypoint: src/charm.py
+    charm-requirements:
+      - requirements.txt

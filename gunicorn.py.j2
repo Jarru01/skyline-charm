@@ -1,0 +1,33 @@
+# /etc/skyline/gunicorn.py
+# Managed by the Juju skyline charm — do not edit by hand.
+
+import multiprocessing
+
+# Bind to loopback only — nginx proxies public traffic.
+# Binding to 0.0.0.0 exposes the raw ASGI app on all interfaces unnecessarily.
+bind = ['127.0.0.1:28000']
+
+{% if gunicorn_workers == "__CPU_COUNT__" %}
+workers = multiprocessing.cpu_count()
+{% else %}
+workers = {{ gunicorn_workers }}
+{% endif %}
+
+# Skyline APIServer is an ASGI application (uvicorn worker required)
+worker_class = 'uvicorn.workers.UvicornWorker'
+
+timeout = {{ gunicorn_timeout }}
+keepalive = 5
+reuse_port = True
+
+# Disable reload in production; enable only with debug=true
+reload = {{ debug }}
+
+# Logging — captured by systemd journal via StandardOutput/StandardError
+accesslog = '-'
+errorlog = '-'
+{% if debug %}
+loglevel = 'debug'
+{% else %}
+loglevel = 'info'
+{% endif %}

@@ -1,0 +1,163 @@
+options:
+  # ── Required ──────────────────────────────────────────────────────────
+  keystone-url:
+    type: string
+    default: ""
+    description: |
+      Full Keystone v3 endpoint URL, e.g. http://10.0.0.1:5000/v3/
+      The charm will append /v3/ if not already present.
+      To find your endpoint:
+        openstack endpoint list --service keystone --interface public
+
+  system-user-password:
+    type: string
+    default: ""
+    description: |
+      Password for the 'skyline' OpenStack service user.
+      This user must exist in Keystone before deploying the charm.
+      Create it with:
+        openstack user create --domain admin_domain --password-prompt skyline
+        openstack role add --project admin --user skyline admin
+
+  # ── Database ──────────────────────────────────────────────────────────
+  database-url:
+    type: string
+    default: ""
+    description: |
+      Full SQLAlchemy database URL, e.g.:
+        mysql://skyline:PASS@10.0.0.2:3306/skyline
+      Leave empty (default) to have the charm install and manage a local
+      MariaDB instance inside the unit.
+
+  database-password:
+    type: string
+    default: ""
+    description: |
+      Password for the local MariaDB skyline user.
+      Only used when database-url is empty (local MariaDB mode).
+      If left empty, a random password is generated on first install and
+      stored in the charm's StoredState.
+
+  # ── OpenStack identity ────────────────────────────────────────────────
+  default-region:
+    type: string
+    default: "RegionOne"
+    description: OpenStack region name.
+
+  system-user-name:
+    type: string
+    default: "skyline"
+    description: Name of the OpenStack service user for Skyline.
+
+  system-user-domain:
+    type: string
+    default: "admin_domain"
+    description: Domain of the Skyline service user.
+
+  system-project:
+    type: string
+    default: "admin"
+    description: System project that Skyline uses for admin-level API calls.
+
+  system-project-domain:
+    type: string
+    default: "admin_domain"
+    description: Domain of the system project.
+
+  interface-type:
+    type: string
+    default: "public"
+    description: |
+      OpenStack endpoint interface type used by the APIServer.
+      One of: public, internal, admin.
+
+  # ── Network / TLS ─────────────────────────────────────────────────────
+  listen-port:
+    type: int
+    default: 9999
+    description: |
+      TCP port on which nginx will listen for browser traffic.
+      Port 9999 is used by default to avoid conflicts with Horizon
+      which typically occupies 80/443.
+
+  ssl-enabled:
+    type: boolean
+    default: false
+    description: |
+      Set ssl_enabled in skyline.yaml.
+      NOTE: This controls skyline's internal SSL flag only. To serve nginx
+      over HTTPS, a separate cert management layer is required.
+
+  # ── Skyline application ───────────────────────────────────────────────
+  debug:
+    type: boolean
+    default: false
+    description: Enable debug logging in skyline-apiserver.
+
+  secret-key:
+    type: string
+    default: ""
+    description: |
+      Session encryption secret key. A cryptographically random value is
+      generated automatically on first install if left empty.
+      WARNING: changing this value after initial deploy will invalidate
+      all active user sessions.
+
+  prometheus-endpoint:
+    type: string
+    default: ""
+    description: |
+      Prometheus endpoint URL, e.g. http://10.0.0.3:9090
+      Leave empty to disable Prometheus integration.
+
+  prometheus-enable-basic-auth:
+    type: boolean
+    default: false
+    description: Enable HTTP Basic Auth when scraping Prometheus.
+
+  prometheus-basic-auth-user:
+    type: string
+    default: ""
+    description: Prometheus Basic Auth username (if enabled).
+
+  prometheus-basic-auth-password:
+    type: string
+    default: ""
+    description: Prometheus Basic Auth password (if enabled).
+
+  sso-enabled:
+    type: boolean
+    default: false
+    description: Enable SSO authentication in skyline.
+
+  sso-region:
+    type: string
+    default: "RegionOne"
+    description: Region used for SSO authentication.
+
+  enforce-new-defaults:
+    type: boolean
+    default: false
+    description: |
+      Enforce new RBAC policy defaults (enforce_new_defaults in skyline.yaml).
+      Only enable if your Keystone policy is configured for new-style RBAC.
+
+  reclaim-instance-interval:
+    type: int
+    default: 604800
+    description: |
+      Interval (in seconds) after which soft-deleted instances are reclaimed.
+      Default is 604800 (7 days).
+
+  # ── gunicorn tuning ───────────────────────────────────────────────────
+  gunicorn-workers:
+    type: int
+    default: 0
+    description: |
+      Number of gunicorn worker processes.
+      Set to 0 (default) to auto-detect based on CPU count (cpu_count()).
+
+  gunicorn-timeout:
+    type: int
+    default: 300
+    description: gunicorn worker timeout in seconds.

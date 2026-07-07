@@ -1,0 +1,34 @@
+# /etc/systemd/system/skyline-apiserver.service
+# Managed by the Juju skyline charm — do not edit by hand.
+
+[Unit]
+Description=OpenStack Skyline APIServer
+Documentation=https://docs.openstack.org/skyline-apiserver/latest/
+After=network-online.target mariadb.service
+Wants=network-online.target
+{% if using_local_db %}Wants=mariadb.service{% endif %}
+
+[Service]
+Type=simple
+User=root
+
+# skyline-apiserver reads its config from this directory
+Environment="OS_CONFIG_DIR={{ skyline_conf_dir }}"
+
+ExecStart={{ venv_dir }}/bin/gunicorn \
+    -c {{ skyline_conf_dir }}/gunicorn.py \
+    skyline_apiserver.main:app
+
+# Allow a generous number of open file descriptors for an API server
+LimitNOFILE=32768
+
+Restart=on-failure
+RestartSec=5s
+
+# Direct all output to the systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skyline-apiserver
+
+[Install]
+WantedBy=multi-user.target

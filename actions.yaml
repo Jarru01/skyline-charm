@@ -1,0 +1,18 @@
+db-sync:
+  description: |
+    Manually trigger a database schema migration (alembic upgrade head).
+    Safe to run at any time — Alembic is idempotent.
+
+get-static-path:
+  description: |
+    Print the filesystem path where skyline-console static assets are installed.
+    Useful for troubleshooting nginx 404 errors.
+
+restart-services:
+  description: Restart skyline-apiserver and reload nginx.
+
+show-config:
+  description: |
+    Print the rendered /etc/skyline/skyline.yaml to the action output.
+    WARNING: output includes the system-user-password in plaintext.
+    Use only for debugging in a trusted environment.
