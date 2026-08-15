@@ -17,8 +17,21 @@ Install sequence
 5.  Discover and store console static path
 
 config-changed
---------------
+-------------
 Re-renders all templates, re-runs db_sync, reloads/restarts services.
+
+nginx config
+------------
+/etc/nginx/nginx.conf is generated from the keystone catalog using the
+shipped `skyline-nginx-generator` (skyline_apiserver.cmd.generate_nginx):
+it emits the /api/openstack/skyline/ strip proxy plus one proxy location per
+cataloged OpenStack service (/api/openstack/<region>/<service>/ -> the real
+service endpoint), which is how the console's overview/admin pages reach
+keystone/nova/cinder/etc. If the generator fails (e.g. keystone unreachable
+at config time), the static templates/nginx.conf.j2 is rendered instead and
+the unit stays active; re-run with the regenerate-nginx action or a juju
+config change once keystone is reachable.
+
 
 """
 
@@ -53,6 +66,7 @@ SYSTEMD_UNIT_PATH  = Path("/etc/systemd/system/skyline-apiserver.service")
 NGINX_CONF_PATH    = Path("/etc/nginx/nginx.conf")
 GUNICORN_CONF_PATH = SKYLINE_CONF_DIR / "gunicorn.py"
 SKYLINE_YAML_PATH  = SKYLINE_CONF_DIR / "skyline.yaml"
+GENERATED_NGINX_PATH = SKYLINE_CONF_DIR / "nginx.conf.generated"
 
 
 class SkylineCharm(ops.CharmBase):
@@ -77,6 +91,7 @@ class SkylineCharm(ops.CharmBase):
         self.framework.observe(self.on.get_static_path_action,  self._on_action_get_static_path)
         self.framework.observe(self.on.restart_services_action, self._on_action_restart_services)
         self.framework.observe(self.on.show_config_action,      self._on_action_show_config)
+        self.framework.observe(self.on.regenerate_nginx_action, self._on_action_regenerate_nginx)
 
     # ── Low-level helpers ───────────────────────────────────────────────────
 
@@ -386,6 +401,60 @@ class SkylineCharm(ops.CharmBase):
 
     # ── Configuration ─────────────────────────────────────────────────────────
 
+    def _generate_nginx_config(self) -> bool:
+        """
+        Generate /etc/nginx/nginx.conf from the keystone catalog using the
+        shipped `skyline-nginx-generator`.
+
+        The generator reads /etc/skyline/skyline.yaml (rendered just before),
+        queries the keystone catalog for the system user, and emits one proxy
+        location per OpenStack service (/api/openstack/<region>/<service>/ ->
+        the real service endpoint) plus the /api/openstack/skyline/ strip and
+        /api/v1/ locations. This is how the console's overview/admin pages
+        reach keystone/nova/cinder/neutron/etc.
+
+        Our gunicorn binds 127.0.0.1:28000 (TCP) while the upstream template
+        points nginx at a unix socket — the emitted config is adjusted to
+        match. Returns True when the catalog-based config was written, False
+        when it fell back to the static templates/nginx.conf.j2.
+        """
+        try:
+            self.unit.status = ops.MaintenanceStatus(
+                "Generating nginx config from keystone catalog"
+            )
+            self._run(
+                [
+                    str(VENV_PY),
+                    "-m",
+                    "skyline_apiserver.cmd.generate_nginx",
+                    "--output-file", str(GENERATED_NGINX_PATH),
+                    "--listen-address", f"0.0.0.0:{self.config['listen-port']}",
+                    "--log-dir", str(SKYLINE_LOG_DIR),
+                ],
+                env=self._venv_env(),
+            )
+            content = GENERATED_NGINX_PATH.read_text(encoding="utf-8")
+            content = content.replace(
+                "server unix:/var/lib/skyline/skyline.sock fail_timeout=0;",
+                "server 127.0.0.1:28000 fail_timeout=0;",
+            )
+            NGINX_CONF_PATH.write_text(content, encoding="utf-8")
+            logger.info(
+                "nginx.conf generated from keystone catalog -> %s", NGINX_CONF_PATH
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "skyline-nginx-generator failed (%s); "
+                "falling back to static templates/nginx.conf.j2 — "
+                "OpenStack service pages will 404 until regenerated",
+                exc,
+            )
+            self._render_template(
+                "nginx.conf.j2", NGINX_CONF_PATH, self._template_context()
+            )
+            return False
+
     def _configure(self):
         error = self._missing_required_config()
         if error:
@@ -404,7 +473,11 @@ class SkylineCharm(ops.CharmBase):
         self._render_template("skyline-apiserver.service.j2", SYSTEMD_UNIT_PATH,  ctx)
 
         if self._stored.static_path:
-            self._render_template("nginx.conf.j2", NGINX_CONF_PATH, ctx)
+            generated = self._generate_nginx_config()
+            logger.info(
+                "nginx config source: %s",
+                "keystone catalog" if generated else "static fallback",
+            )
             nginx_ready = True
         else:
             logger.warning("static_path not set — nginx.conf not rendered")
@@ -522,6 +595,22 @@ class SkylineCharm(ops.CharmBase):
             event.set_results({"skyline-yaml": content})
         except Exception as exc:
             event.fail(str(exc))
+
+    def _on_action_regenerate_nginx(self, event: ops.ActionEvent):
+        """Regenerate /etc/nginx/nginx.conf from the keystone catalog."""
+        try:
+            if not self._stored.installed:
+                event.fail("Charm is not installed yet")
+                return
+            generated = self._generate_nginx_config()
+            self._run(["nginx", "-t"])
+            self._run(["systemctl", "reload-or-restart", "nginx"])
+            event.set_results({
+                "source": "keystone-catalog" if generated else "static-fallback",
+                "config": str(NGINX_CONF_PATH),
+            })
+        except Exception as exc:
+            event.fail(f"regenerate-nginx failed: {exc}")
 
 
 if __name__ == "__main__":

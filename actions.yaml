@@ -16,3 +16,9 @@ show-config:
     Print the rendered /etc/skyline/skyline.yaml to the action output.
     WARNING: output includes the system-user-password in plaintext.
     Use only for debugging in a trusted environment.
+
+regenerate-nginx:
+  description: |
+    Regenerate /etc/nginx/nginx.conf from the keystone catalog using the
+    shipped skyline-nginx-generator, then test and reload nginx. Use after
+    the keystone service catalog changes (new regions/services/endpoints).

@@ -1,6 +1,14 @@
 # /etc/nginx/nginx.conf
 # Managed by the Juju skyline charm — do not edit by hand.
 #
+# FALLBACK TEMPLATE: this file is only rendered when the primary config
+# generation (skyline-nginx-generator, which emits one proxy location per
+# OpenStack service from the keystone catalog) fails — e.g. keystone was
+# unreachable at config time. With this fallback the Skyline API works but
+# OpenStack service endpoints (/api/openstack/<region>/<service>/...) 404.
+# Fix by running the regenerate-nginx action (or a juju config change) once
+# keystone is reachable.
+#
 # Design notes:
 #   - gunicorn binds to 127.0.0.1:28000 (loopback only)
 #   - nginx is the sole public listener on port {{ listen_port }}
@@ -85,7 +93,11 @@ http {
             proxy_set_header   Host               $http_host;
         }
 
-        # ── Other OpenStack API paths (passthrough, full URI kept) ──────
+        # ── Other OpenStack API paths (fallback passthrough) ────────────
+        # FALLBACK ONLY: the primary config (skyline-nginx-generator) proxies
+        # each /api/openstack/<region>/<service>/ to the real OpenStack
+        # endpoint. Here they are sent to gunicorn, which has no such routes,
+        # so service calls return 404 until the config is regenerated.
         location /api/openstack/ {
             proxy_pass         http://skyline_apiserver;
             proxy_redirect     off;
