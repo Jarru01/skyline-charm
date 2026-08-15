@@ -266,11 +266,45 @@ class SkylineCharm(ops.CharmBase):
         env["PBR_VERSION"] = APISERVER_VERSION
         self._pip(["install", "--upgrade", str(repo_path)], env=env)
 
-        # alembic -> sqlalchemy/util/typing.py imports typing_extensions at
-        # runtime, but the apiserver does not declare it. It is only pulled
-        # transitively, which is resolver/mirror dependent, so install it
-        # explicitly to keep `make db_sync` reliable.
-        self._pip(["install", "typing_extensions>=4.6.0"])
+        # sqlalchemy imports typing_extensions at runtime but does not reliably
+        # carry it on every mirror/resolver combination, so install it from the
+        # wheel bundled in files/ (offline) and verify the import immediately.
+        self._install_typing_extensions()
+
+    def _install_typing_extensions(self):
+        """
+        Install typing_extensions from the wheel bundled in files/.
+        Offline and deterministic: no index, no dependency resolution, and a
+        hard verification that the module is actually importable in the venv.
+        """
+        files_dir = Path(self.charm_dir) / "files"
+        wheels = sorted(files_dir.glob("typing_extensions-*.whl"))
+        if wheels:
+            self._pip([
+                "install", "--no-index", "--no-deps",
+                "--force-reinstall", str(wheels[-1]),
+            ])
+        else:
+            module = files_dir / "typing_extensions.py"
+            if not module.exists():
+                raise RuntimeError(
+                    "No typing_extensions wheel or module found in files/. "
+                    "Bundle one before running charmcraft pack."
+                )
+            site_pkgs = next(
+                (p for p in (VENV_DIR / "lib").glob("python*/site-packages")),
+                None,
+            )
+            if site_pkgs is None:
+                raise RuntimeError(f"Cannot locate site-packages under {VENV_DIR}")
+            shutil.copy(str(module), str(site_pkgs / "typing_extensions.py"))
+
+        result = self._run(
+            [str(VENV_PY), "-c",
+             "import typing_extensions; print(typing_extensions.__file__)"],
+            capture=True,
+        )
+        logger.info("typing_extensions verified: %s", result.stdout.strip())
 
     def _install_console(self):
         """
@@ -325,6 +359,13 @@ class SkylineCharm(ops.CharmBase):
 
     def _run_db_sync(self):
         self.unit.status = ops.MaintenanceStatus("Running database migration (db_sync)")
+        try:
+            self._run(
+                [str(VENV_PY), "-c", "import typing_extensions"], capture=True
+            )
+        except subprocess.CalledProcessError:
+            logger.warning("typing_extensions missing in venv; reinstalling bundled wheel")
+            self._install_typing_extensions()
         self._run(["make", "db_sync"], cwd=str(APISERVER_SRC), env=self._venv_env())
         logger.info("db_sync completed successfully.")
 
