@@ -1,0 +1,13 @@
+# Keep the packed charm lean — these are build-only / local-only artifacts.
+.tmp/
+other/
+.git/
+*.charm
+__pycache__/
+*.pyc
+venv/
+.venv/
+build/
+dist/
+node_modules/
+.tox/

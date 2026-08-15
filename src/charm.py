@@ -23,6 +23,7 @@ Re-renders all templates, re-runs db_sync, reloads/restarts services.
 import logging
 import os
 import secrets
+import shutil
 import subprocess
 import textwrap
 import tarfile
@@ -41,6 +42,7 @@ VENV_PIP = VENV_BIN / "pip"
 
 APISERVER_SRC    = Path("/opt/skyline-apiserver-src")
 APISERVER_BRANCH = "stable/2024.2"
+APISERVER_VERSION = "2024.2"
 
 SKYLINE_CONF_DIR   = Path("/etc/skyline")
 SKYLINE_LOG_DIR    = Path("/var/log/skyline")
@@ -93,8 +95,20 @@ class SkylineCharm(ops.CharmBase):
         self._run(["apt-get", "update", "-qq"], env=env)
         self._run(["apt-get", "install", "-y", "--no-install-recommends"] + packages, env=env)
 
-    def _pip(self, args: list):
-        self._run([str(VENV_PIP)] + args)
+    def _pip(self, args: list, env=None):
+        self._run([str(VENV_PIP)] + args, env=env)
+
+    @staticmethod
+    def _safe_extract(tar: tarfile.TarFile, dest: Path):
+        """Extract a tar archive, rejecting any member that would escape dest."""
+        dest_resolved = dest.resolve()
+        for member in tar.getmembers():
+            target = (dest_resolved / member.name).resolve()
+            if target != dest_resolved and dest_resolved not in target.parents:
+                raise RuntimeError(
+                    f"Refusing to extract path outside {dest}: {member.name}"
+                )
+        tar.extractall(path=dest)
 
     def _render_template(self, template_name: str, dest: Path, context: dict):
         tmpl_dir = Path(self.charm_dir) / "templates"
@@ -189,7 +203,7 @@ class SkylineCharm(ops.CharmBase):
         self.unit.status = ops.MaintenanceStatus("Installing system packages")
         # Console build deps removed — wheel is pre-built and bundled in files/
         self._apt_install([
-            "ca-certificates", "curl", "wget",
+            "ca-certificates", "curl", "wget", "git",
             "python3", "python3-pip", "python3-venv",
             "build-essential", "make",
             "nginx", "ssl-cert",
@@ -227,20 +241,30 @@ class SkylineCharm(ops.CharmBase):
 
         # extract into fixed path
         extract_path = APISERVER_SRC
+        if upgrade and extract_path.exists():
+            shutil.rmtree(extract_path)
         extract_path.mkdir(parents=True, exist_ok=True)
 
         with tarfile.open(archive, "r:gz") as tar:
-            tar.extractall(path=extract_path)
+            self._safe_extract(tar, extract_path)
 
-        # find actual repo root (handles nested folder)
-        subdirs = list(extract_path.iterdir())
+        # flatten a single top-level directory (e.g. skyline-apiserver-2024.2-eol/)
+        # so the Makefile sits directly at APISERVER_SRC for `make db_sync`
+        entries = list(extract_path.iterdir())
+        if len(entries) == 1 and entries[0].is_dir():
+            nested = entries[0]
+            for child in nested.iterdir():
+                shutil.move(str(child), str(extract_path / child.name))
+            nested.rmdir()
+
         repo_path = extract_path
-        if len(subdirs) == 1 and subdirs[0].is_dir():
-            repo_path = subdirs[0]
-
         logger.info("Installing apiserver from %s", repo_path)
 
-        self._pip(["install", "--upgrade", str(repo_path)])
+        # pbr derives the package version from git tags; the bundled tarball has
+        # no .git, so pin the version explicitly to avoid a build failure.
+        env = os.environ.copy()
+        env["PBR_VERSION"] = APISERVER_VERSION
+        self._pip(["install", "--upgrade", str(repo_path)], env=env)
 
     def _install_console(self):
         """

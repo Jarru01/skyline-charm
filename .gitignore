@@ -1,2 +1,14 @@
 .tmp/
 other/
+
+# Python
+__pycache__/
+*.pyc
+
+# charmcraft build state
+parts/
+prime/
+stage/
+overlay/
+venv/
+*.charm

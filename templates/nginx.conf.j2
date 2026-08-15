@@ -58,8 +58,9 @@ http {
 
         # ── API proxy ───────────────────────────────────────────────────
         # All /api/openstack/* requests are forwarded to gunicorn.
-        # The trailing slash in proxy_pass strips the location prefix,
-        # which is what skyline-apiserver expects.
+        # There is no trailing slash on proxy_pass, so the full original URI
+        # (/api/openstack/...) is forwarded unchanged — skyline-apiserver is
+        # mounted under that prefix (see nginx_prefix in skyline.yaml).
         location /api/openstack {
             proxy_pass         http://skyline_apiserver;
             proxy_http_version 1.1;

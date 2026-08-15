@@ -19,7 +19,7 @@ description: |
     - keystone-url          full Keystone v3 endpoint URL
     - system-user-password  password of the skyline OpenStack service user
     - files/skyline_console-*.whl must be present before charmcraft pack
-    - files/skyline_apiserver must be present before charmcraft pack
+    - files/skyline-apiserver-*.tar.gz must be present before charmcraft pack
 
 bases:
   - build-on:
