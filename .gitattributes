@@ -1,0 +1,3 @@
+# Normalize to LF on checkout so no CRLF ever reaches the packed charm
+# (CRLF in a shebang line breaks hook execution on the Linux unit).
+* text=auto eol=lf
