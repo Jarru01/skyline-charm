@@ -107,7 +107,10 @@ options:
     type: string
     default: ""
     description: |
-      Prometheus endpoint URL, e.g. http://10.0.0.3:9090
+      Prometheus endpoint URL used by the Monitor pages.
+      The scheme is REQUIRED, e.g. http://10.0.0.3:9090 — a bare
+      host:port (10.0.0.3:9090) makes the apiserver return HTTP 500
+      and the monitoring overview shows no data.
       Leave empty to disable Prometheus integration.
 
   prometheus-enable-basic-auth:

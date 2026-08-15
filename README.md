@@ -1,18 +1,28 @@
-# WORK IN PROGRESS
-# skyline Juju Charm
+# Skyline Juju Charm
 
-Deploys **OpenStack Skyline Dashboard** (stable/2024.2) including:
+Deploys **OpenStack Skyline Dashboard** (stable/2024.2) inside an LXD
+container:
 
 | Component | Detail |
 |---|---|
-| skyline-apiserver | Python ASGI app, gunicorn on `127.0.0.1:28000` |
-| skyline-console | Pre-built Python wheel, served by nginx |
+| skyline-apiserver | Python ASGI app, gunicorn on `127.0.0.1:28000` (loopback) |
+| skyline-console | Pre-built Python wheel, static assets served by nginx |
 | MariaDB | Local instance (optional — skipped if `database-url` is set) |
 | nginx | Public listener, default port `9999` |
 
-The skyline-console wheel and skyline-apiserver source archive are **bundled
-inside the charm** (`files/`) and installed directly. No Node.js, nvm, yarn,
-webpack build, git clone or network access happens on the target machine.
+Everything the unit needs is **bundled inside the charm** (`files/`):
+
+- `files/skyline_console-*.whl` — pre-built console wheel
+- `files/skyline-apiserver-*.tar.gz` — apiserver source (for the alembic tree)
+- `files/wheels/` — a complete offline pip bundle (apiserver wheel + console
+  wheel + `pip`/`setuptools`/`wheel` + every runtime dependency, all pinned)
+
+The Python side is installed **fully offline** — no Node.js, nvm, yarn,
+webpack build, git clone or pip download on the target machine. Only the OS
+packages (nginx, python3-venv, mariadb, ...) are pulled via `apt-get` at
+install time. The only outbound runtime dependency is OpenStack itself
+(keystone, and the services the console displays), which Skyline talks to by
+design.
 
 ---
 
@@ -25,18 +35,75 @@ skyline-charm/
 ├── actions.yaml                       # Juju actions
 ├── requirements.txt                   # Charm Python deps: ops, jinja2
 ├── .charmignore                       # Files excluded from the packed charm
-├── files/
-│   ├── README.txt                     # Build instructions for bundled artifacts
-│   ├── skyline_console-*.whl         # ← pre-built console wheel
-│   └── skyline-apiserver-*.tar.gz    # ← apiserver source archive (offline install)
+├── .gitattributes                     # Forces LF line endings on tracked files
+├── .gitignore                         # Local dev exclusions (.tmp/, *.charm, ...)
 ├── src/
 │   └── charm.py                       # Main ops-framework charm
-└── templates/
-    ├── skyline.yaml.j2
-    ├── gunicorn.py.j2
-    ├── skyline-apiserver.service.j2
-    └── nginx.conf.j2
+├── templates/
+│   ├── skyline.yaml.j2                # apiserver configuration
+│   ├── gunicorn.py.j2                 # gunicorn worker settings
+│   ├── skyline-apiserver.service.j2   # systemd unit for gunicorn
+│   └── nginx.conf.j2                  # FALLBACK nginx config (see "How it works")
+├── files/
+│   ├── README.txt                     # Bundle build / regeneration instructions
+│   ├── skyline_console-*.whl          # ← pre-built console wheel
+│   ├── skyline-apiserver-*.tar.gz     # ← apiserver source archive (db_sync)
+│   └── wheels/                        # ← complete offline pip bundle
+│       ├── requirements.lock          #   pinned lockfile (pip freeze)
+│       ├── skyline_apiserver-*.whl    #   apiserver wheel (PBR_VERSION=2024.2)
+│       └── 99 pinned wheels + lockfile>
+├── .tmp/                              # dev-only scripts (git-ignored, never packed)
+│   ├── build_wheels.sh                #   regenerate files/wheels
+│   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
+│   │   offline_proof.sh, check_db.sh
+│   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
+└── skyline_ubuntu-22.04-amd64.charm   # built artifact (git-ignored)
 ```
+
+---
+
+## How it works
+
+### Routing & nginx
+
+- nginx listens on `listen-port` (default `9999`) — the **only** public entry
+  point.
+- Static console assets are served by nginx directly from the installed
+  `skyline_console` wheel.
+- The Skyline API: `/api/openstack/skyline/*` → stripped → apiserver `/api/v1/*`.
+- The console's overview/admin/monitor pages fetch OpenStack data from the
+  services themselves:
+  `/api/openstack/<region>/<service>/*` (keystone `v3`, nova `v2.1`,
+  cinder `v3`, neutron `v2.0`, glance `v2`, ...) → proxied to the **real**
+  OpenStack endpoints.
+- `/api/v1/*` is also proxied straight to the apiserver for direct access.
+
+`/etc/nginx/nginx.conf` is **generated at config time** by the shipped
+`skyline-nginx-generator` (`skyline_apiserver.cmd.generate_nginx`): it reads
+`/etc/skyline/skyline.yaml`, queries the keystone catalog as the skyline
+system user, and emits one proxy `location` per catalogued service plus the
+`/api/openstack/skyline/` and `/api/v1/` locations. The charm rewires the
+generated upstream from the upstream unix socket to gunicorn's
+`127.0.0.1:28000`.
+
+`templates/nginx.conf.j2` is **only a fallback**. If the generator cannot reach
+keystone at config time (or the catalog is empty), the charm renders the static
+template instead: the Skyline API keeps working, but OpenStack service pages
+return 404 until the config is regenerated. Fix with
+`juju run skyline/0 regenerate-nginx` (or any `juju config` change) once
+keystone is reachable.
+
+### Offline installation
+
+The venv is installed with `pip install --no-index --find-links files/wheels`
+(`PIP_NO_INDEX=1`): pip/setuptools/wheel upgrades, the apiserver wheel
+(`--force-reinstall`), the console wheel, and every dependency from the pinned
+bundle. A `_verify_venv_deps` gate runs `pip check` after install and before
+`db_sync`, force-reinstalling anything missing from the bundle (self-healing,
+fails hard if the venv is still broken after 3 rounds).
+
+The apiserver tarball is only extracted to `/opt/skyline-apiserver-src` so the
+alembic migration tree is available for `make db_sync`.
 
 ---
 
@@ -63,19 +130,27 @@ make package                        # yarn install + webpack build + wheel
 
 ### skyline-apiserver archive
 
-The apiserver is shipped as a source tarball and installed offline by the charm
-(`PBR_VERSION` is pinned by the charm since the archive has no `.git`):
+The apiserver is shipped as a source tarball (the charm pins `PBR_VERSION`
+since the archive has no `.git`):
 
 ```bash
 # extract skyline-apiserver source, then:
 tar czf skyline-apiserver-2024.2.tar.gz skyline-apiserver-2024.2-eol
 ```
 
+### Offline wheel bundle (files/wheels)
+
+The complete set of wheels the unit installs from (see `files/README.txt` for
+details). Regenerate it with `.tmp/build_wheels.sh` (WSL), then prove it
+offline with `.tmp/full_proof.sh` (fresh venv, `PIP_NO_INDEX=1`, `pip check`
+clean, `make db_sync` idempotent).
+
 ## Step 2 — Place the artifacts in the charm
 
 ```bash
 cp skyline_console-5.0.1-py3-none-any.whl skyline-charm/files/
 cp skyline-apiserver-2024.2.tar.gz           skyline-charm/files/
+# if regenerating the bundle: replace skyline-charm/files/wheels/ wholesale
 ```
 
 ## Step 3 — Build the charm
@@ -107,8 +182,13 @@ openstack role add --project admin --user skyline admin
 juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --config keystone-url="http://KEYSTONE_IP:5000/v3/" \
   --config system-user-password="THE_PASSWORD_YOU_SET_ABOVE" \
+  --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
   --to lxd:1
 ```
+
+> **`prometheus-endpoint` must include the scheme** (`http://...`). A bare
+> `host:port` makes the apiserver return HTTP 500 and the Monitor pages show
+> no data.
 
 ## Step 6 — Watch the deployment
 
@@ -121,10 +201,11 @@ Expected progress:
 maintenance: Installing system packages
 maintenance: Installing MariaDB
 maintenance: Creating Python virtualenv
-maintenance: Installing skyline-apiserver
-maintenance: Installing skyline-console wheel   ← fast, no build
+maintenance: Installing skyline-apiserver (offline bundle)
+maintenance: Installing skyline-console wheel
 maintenance: Software installed; awaiting config
 maintenance: Rendering configuration
+maintenance: Generating nginx config from keystone catalog
 maintenance: Running database migration (db_sync)
 active:      Skyline ready on :9999
 ```
@@ -139,29 +220,11 @@ Open `http://<UNIT_IP>:9999` in a browser.
 
 ---
 
-## Useful commands
-
-```bash
-# View charm logs
-juju debug-log --include unit-skyline/0 --replay
-
-# SSH into the unit
-juju ssh skyline/0
-
-# Remove the application
-juju remove-application skyline --force
-
-# Repack after changes
-charmcraft clean && charmcraft pack
-```
-
----
-
 ## Configuration Reference
 
 | Key | Default | Description |
 |---|---|---|
-| `keystone-url` | *(required)* | Full Keystone v3 URL |
+| `keystone-url` | *(required)* | Full Keystone v3 URL (`/v3/` is appended if missing) |
 | `system-user-password` | *(required)* | Password of the `skyline` OS user |
 | `database-url` | `""` | External DB URL; leave empty for local MariaDB |
 | `database-password` | `""` | Local MariaDB password (auto-generated if empty) |
@@ -175,7 +238,7 @@ charmcraft clean && charmcraft pack
 | `debug` | `false` | Enable debug logging |
 | `ssl-enabled` | `false` | Enable SSL flag in skyline.yaml |
 | `secret-key` | `""` | Session key (auto-generated if empty) |
-| `prometheus-endpoint` | `""` | Prometheus URL |
+| `prometheus-endpoint` | `""` | Prometheus URL — **scheme required**, e.g. `http://10.0.0.3:9090`; a bare `host:port` breaks the Monitor pages |
 | `prometheus-enable-basic-auth` | `false` | Basic auth when scraping Prometheus |
 | `prometheus-basic-auth-user` | `""` | Prometheus Basic Auth username |
 | `prometheus-basic-auth-password` | `""` | Prometheus Basic Auth password |
@@ -191,10 +254,11 @@ charmcraft clean && charmcraft pack
 ## Actions
 
 ```bash
-juju run-action skyline/0 db-sync --wait
-juju run-action skyline/0 get-static-path --wait
-juju run-action skyline/0 restart-services --wait
-juju run-action skyline/0 show-config --wait
+juju run skyline/0 db-sync --wait
+juju run skyline/0 get-static-path --wait
+juju run skyline/0 restart-services --wait
+juju run skyline/0 show-config --wait
+juju run skyline/0 regenerate-nginx --wait   # after keystone catalog changes
 ```
 
 ---
@@ -215,6 +279,46 @@ FLUSH PRIVILEGES;
 
 ---
 
+## Customizing the login page image
+
+The login page (`src/layouts/Auth/index.jsx`) uses three images installed with
+the console wheel:
+
+| Purpose | File (inside `static/asset/image/`) |
+|---|---|
+| Login page background (full-bleed, left side) | `login-full.<hash>.png` |
+| Header logo | `logo.png` |
+| Logo inside the login card | `loginRightLogo.png` |
+
+Webpack adds a content hash to `login-full.*` (e.g.
+`login-full.1786807402.png`), so **read the actual name from the unit** before
+replacing it.
+
+```bash
+# 1) See the actual image filename installed on the unit
+juju ssh skyline/0 -- 'sudo ls -l /opt/skyline-venv/lib/python3.10/site-packages/skyline_console/static/asset/image/ | grep -iE "login|logo"'
+
+# 2) Copy your replacement image onto the unit
+juju scp /path/to/your-background.png skyline/0:/home/ubuntu/background.png
+
+# 3) Back up the original, then overwrite keeping the EXACT same filename
+juju ssh skyline/0 -- 'sudo cp /opt/skyline-venv/lib/python3.10/site-packages/skyline_console/static/asset/image/login-full.HASH.png{,.bak} && sudo cp /home/ubuntu/background.png /opt/skyline-venv/lib/python3.10/site-packages/skyline_console/static/asset/image/login-full.HASH.png'
+
+# 4) Reload nginx (no service restart needed), then hard-refresh the browser (Ctrl+Shift+R)
+juju ssh skyline/0 -- 'sudo systemctl reload nginx'
+```
+
+Notes:
+- Match the original's **dimensions** (`file` the original first).
+- Replace the exact hashed filename — nginx serves by that name and the hash
+  in the CSS reference must keep matching.
+- The replacement is a runtime override inside the venv package. A later
+  `juju refresh` re-installs the console wheel and **resets it** to the
+  bundled image. For a persistent image, bundle it in the charm and overlay it
+  during install.
+
+---
+
 ## Troubleshooting
 
 ```bash
@@ -225,31 +329,59 @@ juju debug-log --include unit-skyline/0 --replay
 juju ssh skyline/0
 journalctl -u skyline-apiserver -f
 systemctl status skyline-apiserver nginx mariadb
+```
 
-# gunicorn not on port 28000
+**Login works, but the overview/subpages/admin return 404.**
+The nginx config fell back to the static template because the generator could
+not reach keystone at config time. Once keystone is reachable:
+`juju run skyline/0 regenerate-nginx`. Check which config is live with:
+```bash
+juju ssh skyline/0 -- 'sudo grep -c "proxy_pass http" /etc/nginx/nginx.conf'
+juju debug-log --include unit-skyline/0 --replay | grep -i "nginx config source"
+```
+
+**Monitor overview shows no data.**
+`prometheus-endpoint` must include a scheme:
+```bash
+juju config skyline prometheus-endpoint="http://PROMETHEUS_IP:9090"
+```
+A value like `10.0.0.3:9090` makes the apiserver build an invalid URL and
+return HTTP 500.
+
+**502 Bad Gateway (nginx up, gunicorn down).**
+```bash
 ss -tlnp | grep 28000
 journalctl -u skyline-apiserver --no-pager -n 50
+```
 
-# 502 Bad Gateway (nginx up, gunicorn down)
-# The backend only serves /api/v1/* — there is no /version route.
-curl -s http://127.0.0.1:28000/api/v1/openapi.json
-
-# 401 on login — skyline user missing role
+**401 on login — skyline user missing role.**
+```bash
 openstack role add --project admin --user skyline admin
-curl http://KEYSTONE_IP:5000/v3/
+```
+
+**`juju refresh --path` fails to parse the file.**
+Prefix the path with `./` (a bare filename is treated as a charmstore URL):
+```bash
+juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
 ```
 
 ---
 
-## Upgrading to a new console version
+## Upgrading
 
-1. Build the new wheel on a separate machine
-2. Replace `files/skyline_console-*.whl` with the new file
-3. `charmcraft pack`
-4. `juju upgrade-charm skyline --path ./skyline_ubuntu-22.04-amd64.charm`
+Build the new console wheel / apiserver tarball, update the files, and refresh:
 
-The apiserver source is re-extracted from the bundled tarball and re-installed
-on upgrade, so updating `files/skyline-apiserver-*.tar.gz` works the same way.
+```bash
+cd skyline-charm/
+# replace files/skyline_console-*.whl, files/skyline-apiserver-*.tar.gz,
+# and (if needed) regenerate files/wheels with .tmp/build_wheels.sh
+charmcraft pack
+juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
+```
+
+`upgrade-charm` re-installs the apiserver wheel and console wheel from the
+bundle, re-extracts the tarball for `db_sync`, regenerates the nginx config and
+restarts services.
 
 ---
 
@@ -261,13 +393,19 @@ on upgrade, so updating `files/skyline-apiserver-*.tar.gz` works the same way.
 install
   ├─ apt-get: baseline packages + mariadb (if local DB)
   ├─ python3 -m venv /opt/skyline-venv
-  ├─ extract bundled skyline-apiserver-*.tar.gz → pip install (PBR_VERSION pinned)
-  └─ pip install bundled skyline_console-*.whl from files/
+  ├─ offline upgrade of pip/setuptools/wheel from files/wheels
+  ├─ install apiserver wheel (--no-index --find-links --force-reinstall)
+  ├─ extract bundled tarball → /opt/skyline-apiserver-src (for db_sync)
+  ├─ install console wheel from files/
+  ├─ discover + store console static path
+  └─ verify venv deps (pip check self-heal)
 
 config-changed  (fired automatically after install)
   ├─ validate keystone-url and system-user-password
   ├─ create local MariaDB db/user (if database-url is empty)
-  ├─ render skyline.yaml, gunicorn.py, skyline-apiserver.service, nginx.conf
+  ├─ render skyline.yaml, gunicorn.py, skyline-apiserver.service
+  ├─ GENERATE nginx.conf from the keystone catalog
+  │    (fallback to templates/nginx.conf.j2 if the generator fails)
   ├─ systemctl daemon-reload
   ├─ make db_sync  (Alembic — idempotent)
   └─ enable + restart skyline-apiserver; nginx reload-or-restart
