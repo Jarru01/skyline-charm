@@ -90,7 +90,7 @@ generated upstream from the upstream unix socket to gunicorn's
 keystone at config time (or the catalog is empty), the charm renders the static
 template instead: the Skyline API keeps working, but OpenStack service pages
 return 404 until the config is regenerated. Fix with
-`juju run skyline/0 regenerate-nginx` (or any `juju config` change) once
+`juju run skyline regenerate-nginx` (or any `juju config` change) once
 keystone is reachable.
 
 ### Offline installation
@@ -254,16 +254,28 @@ Open `http://<UNIT_IP>:9999` in a browser.
 ## Actions
 
 ```bash
-juju run skyline/0 db-sync --wait
-juju run skyline/0 get-static-path --wait
-juju run skyline/0 restart-services --wait
-juju run skyline/0 show-config --wait
-juju run skyline/0 regenerate-nginx --wait   # after keystone catalog changes
+juju run skyline db-sync --wait
+juju run skyline get-static-path --wait
+juju run skyline restart-services --wait
+juju run skyline show-config --wait
+juju run skyline regenerate-nginx --wait   # after keystone catalog changes
 ```
+
+(`skyline` targets the whole app — works whatever the unit id is. `juju run
+skyline/0 ...` also works if the unit really is number 0.)
 
 ---
 
 ## Using an External Database
+
+Set `database-url` and the charm skips local MariaDB entirely (no install, no
+`systemctl` service, no `Wants=mariadb.service`). `db_sync` and the runtime
+apiserver both read the exact URL you configure.
+
+> **Do this first.** The charm will NOT create the database, user or grants on
+> an external server. Create them *before* running the config command, or the
+> unit goes `blocked` when `db_sync` cannot connect. Recovery: fix the DB, then
+> re-run `juju config` or `juju run skyline db-sync`.
 
 ```bash
 juju config skyline database-url="mysql://skyline:PASS@10.0.0.5:3306/skyline"
@@ -276,6 +288,26 @@ CREATE DATABASE IF NOT EXISTS skyline
 GRANT ALL PRIVILEGES ON skyline.* TO 'skyline'@'%' IDENTIFIED BY 'YOUR_PASS';
 FLUSH PRIVILEGES;
 ```
+
+Notes:
+
+- **Reachability**: the charm runs inside an LXD container. `localhost` /
+  `127.0.0.1` in the URL means the container itself. For a DB on the Juju host
+  or another machine, use its LAN IP (e.g. `10.0.0.5`), and make sure the DB
+  user can connect from the container's network (`'skyline'@'%'` above).
+- **MySQL 8** (as opposed to MariaDB): `GRANT ... IDENTIFIED BY` is not
+  supported. Create the user separately first:
+  ```sql
+  CREATE USER 'skyline'@'%' IDENTIFIED BY 'YOUR_PASS';
+  GRANT ALL PRIVILEGES ON skyline.* TO 'skyline'@'%';
+  ```
+- **URL-encode special characters** in the password (`@` → `%40`, `#` → `%23`,
+  `/` → `%2F`, `:` → `%3A`, `%` → `%25`), e.g.
+  `mysql://skyline:p%40ss%23word@10.0.0.5:3306/skyline`.
+- **Switching away from the local DB** (setting `database-url` on a unit that
+  previously used local MariaDB) leaves the local database and its data
+  untouched but no longer used — no data is migrated to the external server.
+  The installed local MariaDB keeps running until you remove it manually.
 
 ---
 
@@ -334,7 +366,7 @@ systemctl status skyline-apiserver nginx mariadb
 **Login works, but the overview/subpages/admin return 404.**
 The nginx config fell back to the static template because the generator could
 not reach keystone at config time. Once keystone is reachable:
-`juju run skyline/0 regenerate-nginx`. Check which config is live with:
+`juju run skyline regenerate-nginx`. Check which config is live with:
 ```bash
 juju ssh skyline/0 -- 'sudo grep -c "proxy_pass http" /etc/nginx/nginx.conf'
 juju debug-log --include unit-skyline/0 --replay | grep -i "nginx config source"

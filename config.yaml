@@ -28,6 +28,14 @@ options:
         mysql://skyline:PASS@10.0.0.2:3306/skyline
       Leave empty (default) to have the charm install and manage a local
       MariaDB instance inside the unit.
+      When set, the charm skips local MariaDB and does NOT create the
+      database, user or grants externally — create them first or db_sync
+      will fail and the unit goes blocked.
+      'localhost'/'127.0.0.1' in the URL means the LXD unit itself; use the
+      LAN IP for a DB on the Juju host or another machine.
+      URL-encode special characters in the password (@ -> %40, # -> %23, ...).
+      MariaDB syntax above works for MariaDB; for MySQL 8 create the user
+      separately (CREATE USER ...; GRANT ...).
 
   database-password:
     type: string
