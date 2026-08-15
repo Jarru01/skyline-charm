@@ -180,7 +180,7 @@ openstack role add --project admin --user skyline admin
 
 ```bash
 juju deploy ./skyline_ubuntu-22.04-amd64.charm \
-  --config keystone-url="http://KEYSTONE_IP:5000/v3/" \
+  --config keystone-url="https://KEYSTONE_IP:5000/v3/" \
   --config system-user-password="THE_PASSWORD_YOU_SET_ABOVE" \
   --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
   --to lxd:1

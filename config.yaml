@@ -4,7 +4,7 @@ options:
     type: string
     default: ""
     description: |
-      Full Keystone v3 endpoint URL, e.g. http://10.0.0.1:5000/v3/
+      Full Keystone v3 endpoint URL, e.g. https://10.0.0.1:5000/v3/
       The charm will append /v3/ if not already present.
       To find your endpoint:
         openstack endpoint list --service keystone --interface public
