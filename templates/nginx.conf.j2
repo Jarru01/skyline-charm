@@ -5,7 +5,15 @@
 #   - gunicorn binds to 127.0.0.1:28000 (loopback only)
 #   - nginx is the sole public listener on port {{ listen_port }}
 #   - Static React assets are served directly from the skyline_console package
-#   - /api/openstack/* is proxied to gunicorn
+#   - /api/openstack/skyline/ is stripped and proxied to gunicorn, so the
+#     browser's /api/openstack/skyline/api/v1/* calls reach the backend's
+#     /api/v1/* routes (API_PREFIX in skyline_apiserver/types/constants.py).
+#   - The proxy directives below mirror what skyline-nginx-generator emits
+#     (guide 7.9). In particular, no Upgrade/Connection headers are forwarded:
+#     skyline-apiserver has no WebSocket routes, and uvicorn's httptools
+#     parser would treat a Connection: upgrade request as a WebSocket upgrade
+#     and reject it with HTTP 400 when uvicorn is not installed with
+#     [standard] extras.
 
 user www-data;
 worker_processes auto;
@@ -14,12 +22,19 @@ include /etc/nginx/modules-enabled/*.conf;
 
 events {
     worker_connections 1024;
+    multi_accept on;
 }
 
 http {
     sendfile on;
     tcp_nopush on;
+    tcp_nodelay on;
     types_hash_max_size 2048;
+
+    # No body size limit — large uploads (e.g. Glance images) are streamed to
+    # the backend, matching the config produced by skyline-nginx-generator.
+    client_max_body_size 0;
+    proxy_request_buffering off;
 
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
@@ -56,30 +71,42 @@ http {
         root {{ static_path }};
         index index.html;
 
-        # ── API proxy ───────────────────────────────────────────────────
-        # All /api/openstack/* requests are forwarded to gunicorn.
-        # There is no trailing slash on proxy_pass, so the full original URI
-        # (/api/openstack/...) is forwarded unchanged — skyline-apiserver is
-        # mounted under that prefix (see nginx_prefix in skyline.yaml).
-        location /api/openstack {
+        # ── Skyline API ─────────────────────────────────────────────────
+        # Trailing slash on proxy_pass replaces the matched /api/openstack/skyline/
+        # prefix, so /api/openstack/skyline/api/v1/* -> /api/v1/* on the backend.
+        location /api/openstack/skyline/ {
+            proxy_pass         http://skyline_apiserver/;
+            proxy_redirect     off;
+            proxy_buffering    off;
+
+            proxy_set_header   X-Forwarded-For    $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto  $scheme;
+            proxy_set_header   X-Forwarded-Host   $host;
+            proxy_set_header   Host               $http_host;
+        }
+
+        # ── Other OpenStack API paths (passthrough, full URI kept) ──────
+        location /api/openstack/ {
             proxy_pass         http://skyline_apiserver;
-            proxy_http_version 1.1;
+            proxy_redirect     off;
+            proxy_buffering    off;
 
-            proxy_set_header   Host              $http_host;
-            proxy_set_header   X-Real-IP         $remote_addr;
-            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-            proxy_set_header   X-Forwarded-Proto $scheme;
-            proxy_set_header   Upgrade           $http_upgrade;
-            proxy_set_header   Connection        "upgrade";
+            proxy_set_header   X-Forwarded-For    $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto  $scheme;
+            proxy_set_header   X-Forwarded-Host   $host;
+            proxy_set_header   Host               $http_host;
+        }
 
-            proxy_read_timeout    300;
-            proxy_connect_timeout 300;
-            proxy_send_timeout    300;
+        # ── Direct /api/v1 access ───────────────────────────────────────
+        location /api/v1/ {
+            proxy_pass         http://skyline_apiserver/api/v1/;
+            proxy_redirect     off;
+            proxy_buffering    off;
 
-            # Increase buffer sizes for large API responses
-            proxy_buffer_size          128k;
-            proxy_buffers              4 256k;
-            proxy_busy_buffers_size    256k;
+            proxy_set_header   X-Forwarded-For    $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto  $scheme;
+            proxy_set_header   X-Forwarded-Host   $host;
+            proxy_set_header   Host               $http_host;
         }
 
         # ── React SPA — catch-all ───────────────────────────────────────

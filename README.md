@@ -231,7 +231,8 @@ ss -tlnp | grep 28000
 journalctl -u skyline-apiserver --no-pager -n 50
 
 # 502 Bad Gateway (nginx up, gunicorn down)
-curl -s http://127.0.0.1:28000/api/openstack/skyline/version
+# The backend only serves /api/v1/* — there is no /version route.
+curl -s http://127.0.0.1:28000/api/v1/openapi.json
 
 # 401 on login — skyline user missing role
 openstack role add --project admin --user skyline admin
