@@ -266,6 +266,12 @@ class SkylineCharm(ops.CharmBase):
         env["PBR_VERSION"] = APISERVER_VERSION
         self._pip(["install", "--upgrade", str(repo_path)], env=env)
 
+        # alembic -> sqlalchemy/util/typing.py imports typing_extensions at
+        # runtime, but the apiserver does not declare it. It is only pulled
+        # transitively, which is resolver/mirror dependent, so install it
+        # explicitly to keep `make db_sync` reliable.
+        self._pip(["install", "typing_extensions>=4.6.0"])
+
     def _install_console(self):
         """
         Install the pre-built skyline-console wheel bundled in the charm's
