@@ -8,20 +8,23 @@ The skyline-console wheel is bundled inside the charm (files/ directory)
 and installed directly — no Node.js, nvm, yarn or make build at deploy time.
 
 Install sequence
-----------------
+---------------
 1.  apt: baseline packages + (optional) mariadb
 2.  python3 -m venv /opt/skyline-venv
-3.  install bundled skyline-apiserver stable/2024.2 from files → pip install into venv
-4.  pip install bundled skyline-console wheel from files/
+3.  install skyline-apiserver from the prebuilt wheel + all pinned deps from
+    files/wheels (fully offline: --no-index --find-links; PIP_NO_INDEX=1)
+4.  install bundled skyline-console wheel from files/wheels (offline)
 5.  Discover and store console static path
 
 config-changed
 --------------
 Re-renders all templates, re-runs db_sync, reloads/restarts services.
+
 """
 
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -40,9 +43,7 @@ VENV_BIN = VENV_DIR / "bin"
 VENV_PY  = VENV_BIN / "python3"
 VENV_PIP = VENV_BIN / "pip"
 
-APISERVER_SRC    = Path("/opt/skyline-apiserver-src")
-APISERVER_BRANCH = "stable/2024.2"
-APISERVER_VERSION = "2024.2"
+APISERVER_SRC = Path("/opt/skyline-apiserver-src")
 
 SKYLINE_CONF_DIR   = Path("/etc/skyline")
 SKYLINE_LOG_DIR    = Path("/var/log/skyline")
@@ -79,9 +80,9 @@ class SkylineCharm(ops.CharmBase):
 
     # ── Low-level helpers ───────────────────────────────────────────────────
 
-    def _run(self, cmd, input_data=None, env=None, cwd=None, capture=False):
+    def _run(self, cmd, input_data=None, env=None, cwd=None, capture=False, check=True):
         logger.debug("run: %s", " ".join(str(x) for x in cmd))
-        kwargs = dict(check=True, cwd=cwd, env=env)
+        kwargs = dict(check=check, cwd=cwd, env=env)
         if input_data is not None:
             kwargs["input"] = input_data
         if capture:
@@ -127,6 +128,9 @@ class SkylineCharm(ops.CharmBase):
         env["OS_CONFIG_DIR"] = str(SKYLINE_CONF_DIR)
         env["VIRTUAL_ENV"]   = str(VENV_DIR)
         return env
+
+    def _wheels_dir(self) -> Path:
+        return Path(self.charm_dir) / "files" / "wheels"
 
     # ── Config helpers ──────────────────────────────────────────────────────
 
@@ -217,13 +221,18 @@ class SkylineCharm(ops.CharmBase):
     def _setup_venv(self):
         self.unit.status = ops.MaintenanceStatus("Creating Python virtualenv")
         self._run(["python3", "-m", "venv", str(VENV_DIR)])
-        self._pip(["install", "--upgrade", "pip"])
-        self._pip(["install", "--upgrade", "wheel", "setuptools"])
+        wheels_dir = self._wheels_dir()
+        self._pip([
+            "install", "--no-index", "--find-links", str(wheels_dir),
+            "--upgrade", "pip", "setuptools", "wheel",
+        ])
 
     def _install_apiserver(self, upgrade: bool = False):
         """
-        Install skyline-apiserver from bundled tar.gz in files/.
-        No git or network access required.
+        Install skyline-apiserver from the prebuilt wheel bundled in files/wheels.
+        The bundled tar.gz is only extracted to APISERVER_SRC so that the
+        alembic migration tree is available for `make db_sync`.
+        Fully offline: --no-index --find-links, no git, no network access.
         """
         self.unit.status = ops.MaintenanceStatus("Installing skyline-apiserver (offline bundle)")
 
@@ -239,7 +248,7 @@ class SkylineCharm(ops.CharmBase):
         archive = archives[-1]
         logger.info("Using bundled apiserver archive: %s", archive.name)
 
-        # extract into fixed path
+        # extract into fixed path (needed for `make db_sync` later)
         extract_path = APISERVER_SRC
         if upgrade and extract_path.exists():
             shutil.rmtree(extract_path)
@@ -257,54 +266,20 @@ class SkylineCharm(ops.CharmBase):
                 shutil.move(str(child), str(extract_path / child.name))
             nested.rmdir()
 
-        repo_path = extract_path
-        logger.info("Installing apiserver from %s", repo_path)
-
-        # pbr derives the package version from git tags; the bundled tarball has
-        # no .git, so pin the version explicitly to avoid a build failure.
-        env = os.environ.copy()
-        env["PBR_VERSION"] = APISERVER_VERSION
-        self._pip(["install", "--upgrade", str(repo_path)], env=env)
-
-        # sqlalchemy imports typing_extensions at runtime but does not reliably
-        # carry it on every mirror/resolver combination, so install it from the
-        # wheel bundled in files/ (offline) and verify the import immediately.
-        self._install_typing_extensions()
-
-    def _install_typing_extensions(self):
-        """
-        Install typing_extensions from the wheel bundled in files/.
-        Offline and deterministic: no index, no dependency resolution, and a
-        hard verification that the module is actually importable in the venv.
-        """
-        files_dir = Path(self.charm_dir) / "files"
-        wheels = sorted(files_dir.glob("typing_extensions-*.whl"))
-        if wheels:
-            self._pip([
-                "install", "--no-index", "--no-deps",
-                "--force-reinstall", str(wheels[-1]),
-            ])
-        else:
-            module = files_dir / "typing_extensions.py"
-            if not module.exists():
-                raise RuntimeError(
-                    "No typing_extensions wheel or module found in files/. "
-                    "Bundle one before running charmcraft pack."
-                )
-            site_pkgs = next(
-                (p for p in (VENV_DIR / "lib").glob("python*/site-packages")),
-                None,
+        wheels_dir = self._wheels_dir()
+        apiserver_wheels = sorted(wheels_dir.glob("skyline_apiserver-*.whl"))
+        if not apiserver_wheels:
+            raise RuntimeError(
+                f"No skyline_apiserver wheel found in {wheels_dir}. "
+                "Rebuild the offline bundle (see files/README.txt)."
             )
-            if site_pkgs is None:
-                raise RuntimeError(f"Cannot locate site-packages under {VENV_DIR}")
-            shutil.copy(str(module), str(site_pkgs / "typing_extensions.py"))
 
-        result = self._run(
-            [str(VENV_PY), "-c",
-             "import typing_extensions; print(typing_extensions.__file__)"],
-            capture=True,
-        )
-        logger.info("typing_extensions verified: %s", result.stdout.strip())
+        wheel_path = apiserver_wheels[-1]
+        logger.info("Installing apiserver wheel (offline): %s", wheel_path.name)
+        self._pip([
+            "install", "--no-index", "--find-links", str(wheels_dir),
+            "--force-reinstall", str(wheel_path),
+        ])
 
     def _install_console(self):
         """
@@ -324,7 +299,10 @@ class SkylineCharm(ops.CharmBase):
 
         wheel_path = wheels[-1]
         logger.info("Installing bundled console wheel: %s", wheel_path.name)
-        self._pip(["install", str(wheel_path)])
+        self._pip([
+            "install", "--no-index", "--find-links", str(self._wheels_dir()),
+            "--force-reinstall", str(wheel_path),
+        ])
 
         result = self._run(
             [str(VENV_PY), "-c",
@@ -357,15 +335,52 @@ class SkylineCharm(ops.CharmBase):
         for d in [SKYLINE_CONF_DIR, SKYLINE_LOG_DIR, SKYLINE_POLICY_DIR]:
             d.mkdir(parents=True, exist_ok=True)
 
+    def _verify_venv_deps(self, max_rounds: int = 3):
+        """
+        Gate: run `pip check` and force-reinstall anything reported as missing
+        from the offline bundle (files/wheels) until the venv is clean.
+
+        Every wheel in the bundle is pinned by the regenerated lockfile, so a
+        reinstall is guaranteed to be deterministic. Fails hard if the venv is
+        still broken after max_rounds (rather than silently shipping a broken
+        install).
+        """
+        wheels_dir = self._wheels_dir()
+        missing_re = re.compile(
+            r"^\S+ [^\s,]+ requires ([^,]+), which is not installed\.$",
+            re.MULTILINE,
+        )
+        for round_no in range(1, max_rounds + 1):
+            result = self._run([str(VENV_PIP), "check"], capture=True, check=False)
+            if result.returncode == 0:
+                logger.info("pip check: venv dependencies clean (round %d)", round_no)
+                return
+            missing = {
+                dep.strip() for dep in missing_re.findall(result.stdout)
+            }
+            if not missing:
+                raise RuntimeError(
+                    f"pip check failed but no missing packages were identified: "
+                    f"{result.stdout.strip()}"
+                )
+            logger.warning(
+                "pip check round %d: reinstalling missing deps from bundle: %s",
+                round_no, ", ".join(sorted(missing)),
+            )
+            for dep in sorted(missing):
+                self._pip([
+                    "install", "--no-index", "--find-links", str(wheels_dir),
+                    "--force-reinstall", dep,
+                ])
+        result = self._run([str(VENV_PIP), "check"], capture=True, check=False)
+        raise RuntimeError(
+            f"Dependencies still not satisfied after {max_rounds} rounds: "
+            f"{result.stdout.strip()}"
+        )
+
     def _run_db_sync(self):
         self.unit.status = ops.MaintenanceStatus("Running database migration (db_sync)")
-        try:
-            self._run(
-                [str(VENV_PY), "-c", "import typing_extensions"], capture=True
-            )
-        except subprocess.CalledProcessError:
-            logger.warning("typing_extensions missing in venv; reinstalling bundled wheel")
-            self._install_typing_extensions()
+        self._verify_venv_deps()
         self._run(["make", "db_sync"], cwd=str(APISERVER_SRC), env=self._venv_env())
         logger.info("db_sync completed successfully.")
 
@@ -419,6 +434,7 @@ class SkylineCharm(ops.CharmBase):
             self._setup_venv()
             self._install_apiserver()
             self._install_console()
+            self._verify_venv_deps()
             self._stored.installed = True
             logger.info("Skyline software installation complete.")
             self.unit.status = ops.MaintenanceStatus("Software installed; awaiting config")
