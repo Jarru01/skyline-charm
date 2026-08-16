@@ -7,7 +7,7 @@ container:
 |---|---|
 | skyline-apiserver | Python ASGI app, gunicorn on `127.0.0.1:28000` (loopback) |
 | skyline-console | Pre-built Python wheel, static assets served by nginx |
-| MariaDB | Local instance (optional — skipped if `database-url` is set) |
+| MariaDB | Local instance (optional — skipped if `database-url` is set or a `mysql-router` `shared-db` relation provides the DB) |
 | nginx | Public listener, default port `9999` |
 
 Everything the unit needs is **bundled inside the charm** (`files/`):
@@ -268,6 +268,89 @@ skyline/0 ...` also works if the unit really is number 0.)
 
 ## Using an External Database
 
+### Via a mysql-router backed by mysql-innodb-cluster (recommended, HA-ready)
+
+This is the production path used by every other service in the model: a
+`mysql-router` subordinate is co-located on each skyline unit and fronts a
+`mysql-innodb-cluster`. The app still connects to `127.0.0.1:3306`-inside-its-
+container, but that socket is now the router, which proxies to the (HA)
+InnoDB Cluster — the cluster auto-provisions the `skyline` database and user.
+
+**Prerequisite — a healthy InnoDB Cluster + vault (for TLS)**
+
+The cluster needs to exist and be ONLINE, and vault must be able to issue the
+router certificates. If you are starting from scratch:
+
+```bash
+juju deploy --channel 8.0/stable mysql-innodb-cluster --to lxd:0       # 3 units via -n 3
+juju relate mysql-innodb-cluster:vault vault:certificates              # router TLS chain
+# wait until: "Unit is ready: Mode: R/W, Cluster is ONLINE and can tolerate up to ONE failure."
+```
+
+**Step 1 — Deploy the router subordinate**
+
+```bash
+juju deploy mysql-router skyline-mysql-router --channel 8.0/stable
+```
+
+**Step 2 — Wire up the relations (all three are required)**
+
+```bash
+juju relate skyline-mysql-router:db-router     mysql-innodb-cluster:db-router
+juju relate skyline-mysql-router:certificates  vault:certificates
+juju relate skyline:shared-db                  skyline-mysql-router:shared-db
+```
+
+Expected integrations once healthy (`juju status --relations`):
+
+| Provider | Requirer | Interface | Purpose |
+|---|---|---|---|
+| `mysql-innodb-cluster:db-router` | `skyline-mysql-router:db-router` | `mysql-router` | router joins the cluster |
+| `vault:certificates` | `skyline-mysql-router:certificates` | `tls-certificates` | TLS on the router ↔ cluster link |
+| `skyline-mysql-router:shared-db` | `skyline:shared-db` | `mysql-shared` *(subordinate)* | DB + user provisioning |
+| `skyline:skyline-peers` | `skyline:skyline-peers` | `skyline-peers` *(peer)* | uniform session secret |
+
+**Step 3 — What happens automatically (no `database-url` config needed)**
+
+1. The charm publishes `{database: skyline, username: skyline, hostname: <unit IP>}`
+   on the requirer side of the `shared-db` relation (mysql-shared contract).
+2. The router forwards that as `MRUP_*` keys to the cluster; the cluster creates
+   the `skyline` database + `skyline` user and grants it access.
+3. The router publishes `db_host/db_port/username/password` back. The charm
+   detects it, **stops and disables the local MariaDB** (so the router can bind
+   `127.0.0.1:3306`), re-renders `skyline.yaml` (`database_url` now points at
+   `mysql://skyline:...@127.0.0.1:3306/skyline`) and re-runs `db_sync`.
+
+**InnoDB Cluster primary-key note (error 3098)**
+
+Group Replication rejects *any* INSERT/UPDATE/DELETE on a table without a
+PRIMARY KEY (or non-null UNIQUE key) — MySQL error 3098, *"The table does not
+comply with the requirements by an external plugin."* The stock Skyline alembic
+revision (`000_init.py`) creates `revoked_token` and `settings` **without**
+primary keys. That is harmless on standalone MariaDB, but on the cluster it
+breaks login: the profile flow's first write (a `DELETE` on `revoked_token`)
+fails with 3098 and the console returns 401.
+
+`db_sync` therefore finishes with an idempotent
+`ALTER TABLE ... ADD COLUMN id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST`
+on both tables (`_ensure_db_primary_keys()` in `src/charm.py`), so **no manual
+DDL is needed**. Keep that step in the charm and never run a bare `alembic`
+outside the charm against the cluster, or login breaks again with 3098.
+
+**Step 4 — Verify**
+
+```bash
+juju status skyline skyline-mysql-router mysql-innodb-cluster --relations
+juju run skyline show-config --wait     # database_url: mysql://skyline:...@127.0.0.1:3306/skyline
+juju run skyline db-sync --wait         # migrate, including the PK fix
+juju ssh skyline/0 -- 'systemctl is-active mariadb'   # expect: inactive
+juju ssh skyline/0 -- 'ss -ltn | grep 330'            # expect: router on 3306-3309
+```
+
+Then log into `http://<UNIT_IP>:9999`.
+
+### Via the `database-url` config option
+
 Set `database-url` and the charm skips local MariaDB entirely (no install, no
 `systemctl` service, no `Wants=mariadb.service`). `db_sync` and the runtime
 apiserver both read the exact URL you configure.
@@ -276,6 +359,9 @@ apiserver both read the exact URL you configure.
 > an external server. Create them *before* running the config command, or the
 > unit goes `blocked` when `db_sync` cannot connect. Recovery: fix the DB, then
 > re-run `juju config` or `juju run skyline db-sync`.
+
+> A `shared-db` relation, when present, **takes precedence** over
+> `database-url`.
 
 ```bash
 juju config skyline database-url="mysql://skyline:PASS@10.0.0.5:3306/skyline"
@@ -308,6 +394,29 @@ Notes:
   previously used local MariaDB) leaves the local database and its data
   untouched but no longer used — no data is migrated to the external server.
   The installed local MariaDB keeps running until you remove it manually.
+
+---
+
+## Scaling out / High availability
+
+Skyline backends are **stateless** (gunicorn ASGI on `127.0.0.1:28000`, signed
+session tokens, no WebSockets), so you can run several units behind a load
+balancer without sticky sessions:
+
+```bash
+juju relate skyline:shared-db skyline-mysql-router:shared-db   # shared cluster DB
+juju add-unit skyline -n 2                                     # same DB, same secret
+```
+
+Two prerequisites are handled by the charm but worth verifying after scaling:
+
+1. **One shared database** — every unit must use the same mysql-router
+   `shared-db` relation (see above). Never scale with per-unit local MariaDB.
+2. **One uniform `secret_key`** — the leader publishes it over
+   `skyline-peers`; check each unit with `juju run skyline show-config --wait`.
+
+Terminal sides are the access layer (HAProxy + Keepalived VIP, the pattern used
+for Horizon) and monitoring; both are out of scope of this charm.
 
 ---
 
@@ -434,20 +543,41 @@ install
 
 config-changed  (fired automatically after install)
   ├─ validate keystone-url and system-user-password
-  ├─ create local MariaDB db/user (if database-url is empty)
+  ├─ publish uniform secret_key to skyline-peers (leader)
+  ├─ create local MariaDB db/user (if no shared-db relation and database-url is empty)
+  │   (when a mysql-router shared-db relation IS present, stop/disable local
+  │    MariaDB instead so the router can bind 127.0.0.1:3306)
   ├─ render skyline.yaml, gunicorn.py, skyline-apiserver.service
+  │    (database_url = shared-db relation > database-url config > local MariaDB)
   ├─ GENERATE nginx.conf from the keystone catalog
   │    (fallback to templates/nginx.conf.j2 if the generator fails)
   ├─ systemctl daemon-reload
   ├─ make db_sync  (Alembic — idempotent)
+  │    └─ after: ensure InnoDB Cluster primary keys on revoked_token/settings
+  │         (idempotent ALTER; required for Group Replication writes, error 3098)
   └─ enable + restart skyline-apiserver; nginx reload-or-restart
+
+shared-db relation-changed/broken
+  └─ same re-render + db_sync path (switch to/from the router-provided DB)
+
+skyline-peers relation-changed (new unit / rotated secret_key)
+  └─ re-render with the leader-published key
 
 start
   └─ confirm skyline-apiserver is active → set ActiveStatus
 ```
 
-### Secret key persistence
+### Secret key persistence & HA
 
-The session `secret_key` is generated once with `secrets.token_urlsafe(32)` and
-stored in `ops.StoredState`. It survives `config-changed` and `upgrade-charm`.
-To rotate: `juju config skyline secret-key=NEW_VALUE` (invalidates all sessions).
+Sessions are signed with `secret_key`, so it must be **identical on every
+unit**. The leader generates one key once and publishes it over the
+`skyline-peers` relation; scaled-out units render the same value automatically.
+An explicit `secret-key` config value always wins (seed or rotation) and is
+propagated to all units:
+
+```bash
+juju config skyline secret-key=NEW_VALUE   # rotate — invalidates all sessions
+```
+
+Verify uniformity across units with `juju run skyline show-config --wait` on
+each one.

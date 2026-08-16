@@ -44,6 +44,7 @@ import subprocess
 import textwrap
 import tarfile
 from pathlib import Path
+from urllib.parse import quote
 
 import ops
 from jinja2 import Environment, FileSystemLoader
@@ -86,6 +87,13 @@ class SkylineCharm(ops.CharmBase):
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.start,          self._on_start)
         self.framework.observe(self.on.upgrade_charm,  self._on_upgrade_charm)
+
+        self.framework.observe(self.on["shared-db"].relation_changed,
+                               self._on_shared_db_changed)
+        self.framework.observe(self.on["shared-db"].relation_broken,
+                               self._on_shared_db_changed)
+        self.framework.observe(self.on["skyline-peers"].relation_changed,
+                               self._on_peers_changed)
 
         self.framework.observe(self.on.db_sync_action,          self._on_action_db_sync)
         self.framework.observe(self.on.get_static_path_action,  self._on_action_get_static_path)
@@ -149,7 +157,61 @@ class SkylineCharm(ops.CharmBase):
 
     # ── Config helpers ──────────────────────────────────────────────────────
 
+    def _shared_db_data(self):
+        """
+        Connection info from the mysql-router ``shared-db`` relation.
+
+        Compatible with the mysql-router (canonical) subordinate, which provides
+        per-unit keys db_host/db_port/username/password/database. Older
+        mysql-shared providers used host/port/user/db_name — both spellings are
+        tolerated. Returns None until the router has published usable data.
+        """
+        relations = self.model.relations.get("shared-db") or []
+        for relation in relations:
+            candidates = []
+            if relation.app is not None:
+                candidates.append(relation.data[relation.app])
+            candidates.extend(relation.data[unit] for unit in relation.units)
+            for data in candidates:
+                d = dict(data)
+                host = d.get("db_host") or d.get("host")
+                if not host:
+                    continue
+                return {
+                    "host": host,
+                    "port": d.get("db_port") or d.get("port") or "3306",
+                    "username": d.get("username") or d.get("user") or "skyline",
+                    "password": d.get("password") or "",
+                    "database": d.get("database") or d.get("db_name") or "skyline",
+                }
+        return None
+
+    def _publish_shared_db_request(self) -> None:
+        """
+        Requirer half of the mysql-shared contract: advertise which database
+        and user the mysql-router must create on the cluster.
+
+        The router reads a singleset {database, username, hostname} from our
+        shared-db relation data, proxies it to mysql-innodb-cluster as
+        MRUP_* keys, and once the cluster provisions the DB/user it publishes
+        db_host/db_port/username/password back for ``_shared_db_data`` to pick
+        up. Idempotent; no-op when the relation is absent or unbound.
+        """
+        for rel in self.model.relations.get("shared-db") or []:
+            try:
+                hostname = str(self.model.get_binding(rel).network.ingress_address)
+            except Exception as exc:
+                logger.warning("shared-db: cannot determine hostname: %s", exc)
+                continue
+            want = {"database": "skyline", "username": "skyline", "hostname": hostname}
+            unit_data = rel.data[self.unit]
+            if any(unit_data.get(k) != v for k, v in want.items()):
+                unit_data.update(want)
+                logger.info("published shared-db DB request: %s", want)
+
     def _using_local_db(self) -> bool:
+        if self._shared_db_data():
+            return False
         return not bool(self.config.get("database-url", "").strip())
 
     def _db_password(self) -> str:
@@ -159,12 +221,64 @@ class SkylineCharm(ops.CharmBase):
         return self._stored.db_password
 
     def _secret_key(self) -> str:
+        """Return the session secret every unit must share.
+
+        Priority: explicit ``secret-key`` config (operator-defined seed /
+        rotation) > value published by the leader over ``skyline-peers`` > the
+        unit's own stored (or freshly generated) key.
+        """
+        cfg = self.config.get("secret-key", "").strip()
+        if cfg:
+            return cfg
+        peers = self.model.relations.get("skyline-peers") or []
+        if peers:
+            relation = peers[0]
+            if relation.app is not None:
+                peer_key = relation.data[self.model.app].get("secret_key", "")
+                if peer_key:
+                    return peer_key
         if not self._stored.secret_key:
-            cfg = self.config.get("secret-key", "").strip()
-            self._stored.secret_key = cfg if cfg else secrets.token_urlsafe(32)
+            self._stored.secret_key = secrets.token_urlsafe(32)
         return self._stored.secret_key
 
+    def _publish_secret_key(self) -> None:
+        """
+        Ensure a single uniform session secret across all skyline units.
+
+        The leader owns the auto-generated key and publishes it in the
+        ``skyline-peers`` app databag so scaled-out units render the same
+        ``secret_key`` (required for HA — sessions are signed with it). An
+        explicit ``secret-key`` config value always wins (seed or rotation).
+        """
+        cfg = self.config.get("secret-key", "").strip()
+        if cfg:
+            effective = cfg
+        else:
+            if not self._stored.secret_key:
+                self._stored.secret_key = secrets.token_urlsafe(32)
+            effective = self._stored.secret_key
+
+        peers = self.model.relations.get("skyline-peers") or []
+        if not peers or not self.unit.is_leader():
+            return
+        relation = peers[0]
+        if relation.app is None:
+            return
+        app_data = relation.data[self.model.app]
+        if app_data.get("secret_key") != effective:
+            app_data["secret_key"] = effective
+            logger.info("Published uniform secret_key to skyline-peers")
+
     def _database_url(self) -> str:
+        shared = self._shared_db_data()
+        if shared:
+            return "mysql://{user}:{passwd}@{host}:{port}/{db}".format(
+                user=quote(shared["username"], safe=""),
+                passwd=quote(shared["password"], safe=""),
+                host=shared["host"],
+                port=shared["port"],
+                db=quote(shared["database"], safe=""),
+            )
         if not self._using_local_db():
             return self.config["database-url"].strip()
         return f"mysql://skyline:{self._db_password()}@localhost:3306/skyline"
@@ -397,7 +511,60 @@ class SkylineCharm(ops.CharmBase):
         self.unit.status = ops.MaintenanceStatus("Running database migration (db_sync)")
         self._verify_venv_deps()
         self._run(["make", "db_sync"], cwd=str(APISERVER_SRC), env=self._venv_env())
+        self._ensure_db_primary_keys()
         logger.info("db_sync completed successfully.")
+
+    def _ensure_db_primary_keys(self):
+        """
+        Group Replication (mysql-innodb-cluster) refuses any DML on tables
+        without a primary key (or non-null unique key) — MySQL error 3098.
+        The stock Skyline migration 000_init.py creates `revoked_token` and
+        `settings` with only a secondary index, so writes (e.g. the login
+        profile's revoked-token purge) fail once the DB is a GR cluster.
+
+        Give those tables an AUTO_INCREMENT `id` primary key, idempotently.
+        Only relevant when the shared-db (router) path is active; no-op on a
+        local MariaDB where schema stays exactly as Skyline ships it.
+        """
+        if self._using_local_db():
+            return
+        shared = self._shared_db_data()
+        if not shared:
+            return
+        db = shared["database"]
+        env = self._venv_env()
+        env["MYSQL_PWD"] = shared["password"]
+        base = [
+            "mysql", "--no-defaults",
+            "-h", shared["host"],
+            "-P", shared["port"],
+            "-u", shared["username"],
+            "-N", "-B",
+        ]
+        for table in ("revoked_token", "settings"):
+            check = [
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = '{table}' "
+                "AND COLUMN_NAME = 'id'"
+            ]
+            result = self._run(
+                base + [db, "-e", check[0]], env=env, capture=True, check=True
+            )
+            if result.stdout.strip().splitlines()[0].strip() == "1":
+                logger.info("PK already present on %s — skipping", table)
+                continue
+            self._run(
+                base
+                + [
+                    db,
+                    "-e",
+                    f"ALTER TABLE `{table}` ADD COLUMN `id` "
+                    "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+                ],
+                env=env,
+                check=True,
+            )
+            logger.info("Added AUTO_INCREMENT primary key to %s", table)
 
     # ── Configuration ─────────────────────────────────────────────────────────
 
@@ -460,12 +627,19 @@ class SkylineCharm(ops.CharmBase):
         if error:
             self.unit.status = ops.BlockedStatus(error)
             return False
+        self._publish_shared_db_request()
 
         self.unit.status = ops.MaintenanceStatus("Rendering configuration")
         self._ensure_directories()
 
         if self._using_local_db():
             self._setup_local_mariadb()
+        else:
+            # We are on the cluster: stop local MariaDB BEFORE db_sync so it
+            # cannot keep holding 127.0.0.1:3306 away from the mysql-router
+            # subordinate. check=False: mariadb may not be installed on a
+            # never-local unit.
+            self._run(["systemctl", "disable", "--now", "mariadb"], check=False)
 
         ctx = self._template_context()
         self._render_template("skyline.yaml.j2",              SKYLINE_YAML_PATH,  ctx)
@@ -491,6 +665,11 @@ class SkylineCharm(ops.CharmBase):
     def _restart_services(self, nginx: bool = True):
         if self._using_local_db():
             self._run(["systemctl", "enable", "--now", "mariadb"])
+        else:
+            # Free 127.0.0.1:3306 for the mysql-router subordinate when we've
+            # flipped to the cluster-backed shared-db. check=False: mariadb
+            # may not even be installed on a never-local unit.
+            self._run(["systemctl", "disable", "--now", "mariadb"], check=False)
         self._run(["systemctl", "enable", "skyline-apiserver"])
         self._run(["systemctl", "restart", "skyline-apiserver"])
         if nginx:
@@ -521,6 +700,7 @@ class SkylineCharm(ops.CharmBase):
             event.defer()
             return
         try:
+            self._publish_secret_key()
             ok = self._configure()
             if ok:
                 self.unit.status = ops.ActiveStatus(
@@ -557,6 +737,7 @@ class SkylineCharm(ops.CharmBase):
         try:
             self._install_apiserver(upgrade=True)
             self._install_console()
+            self._publish_secret_key()
             ok = self._configure()
             if ok:
                 self.unit.status = ops.ActiveStatus(
@@ -566,11 +747,56 @@ class SkylineCharm(ops.CharmBase):
             logger.exception("upgrade-charm failed")
             self.unit.status = ops.BlockedStatus(f"Upgrade failed: {exc}")
 
+    def _on_shared_db_changed(self, event: ops.RelationChangedEvent):
+        """
+        mysql-router (shared-db) data appeared or went away.
+
+        When a router provides database_url it overrides the config value and
+        switches the charm out of local-MariaDB mode; db_sync + templates are
+        re-run so the apiserver moves to the cluster.
+        """
+        if not self._stored.installed:
+            self.unit.status = ops.WaitingStatus("Waiting for install to complete")
+            event.defer()
+            return
+        try:
+            self._publish_secret_key()
+            ok = self._configure()
+            if ok:
+                self.unit.status = ops.ActiveStatus(
+                    f"Skyline ready on :{self.config['listen-port']}"
+                )
+        except Exception as exc:
+            logger.exception("shared-db relation handler failed")
+            self.unit.status = ops.BlockedStatus(f"Database relation error: {exc}")
+
+    def _on_peers_changed(self, event: ops.RelationChangedEvent):
+        """
+        A leader-published secret_key (or a new peer) arrived — re-render so
+        every unit signs sessions with the identical key (HA requirement).
+        """
+        if not self._stored.installed:
+            self.unit.status = ops.WaitingStatus("Waiting for install to complete")
+            event.defer()
+            return
+        try:
+            ok = self._configure()
+            if ok:
+                self.unit.status = ops.ActiveStatus(
+                    f"Skyline ready on :{self.config['listen-port']}"
+                )
+        except Exception as exc:
+            logger.exception("peer relation handler failed")
+            self.unit.status = ops.BlockedStatus(f"Peers error: {exc}")
+
     # ── Actions ───────────────────────────────────────────────────────────────
 
     def _on_action_db_sync(self, event: ops.ActionEvent):
         try:
             self._run_db_sync()
+            self.unit.status = ops.ActiveStatus(
+                f"Skyline ready on :{self.config['listen-port']}"
+            )
             event.set_results({"result": "db_sync completed successfully"})
         except Exception as exc:
             event.fail(f"db_sync failed: {exc}")

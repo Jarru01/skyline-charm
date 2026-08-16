@@ -28,6 +28,9 @@ options:
         mysql://skyline:PASS@10.0.0.2:3306/skyline
       Leave empty (default) to have the charm install and manage a local
       MariaDB instance inside the unit.
+      When a mysql-router 'shared-db' relation provides a database (the
+      recommended path for HA deployments), it takes precedence over this
+      config value.
       When set, the charm skips local MariaDB and does NOT create the
       database, user or grants externally — create them first or db_sync
       will fail and the unit goes blocked.
@@ -106,10 +109,12 @@ options:
     type: string
     default: ""
     description: |
-      Session encryption secret key. A cryptographically random value is
-      generated automatically on first install if left empty.
-      WARNING: changing this value after initial deploy will invalidate
-      all active user sessions.
+      Session encryption secret key. All skyline units must use the SAME
+      value (sessions are signed with it), so in HA deployments the leader
+      auto-generates one key and shares it with every unit over the
+      skyline-peers relation.
+      Setting an explicit value here seeds or rotates the key across all
+      units. WARNING: changing it invalidates all active user sessions.
 
   prometheus-endpoint:
     type: string

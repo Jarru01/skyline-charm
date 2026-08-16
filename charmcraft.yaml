@@ -33,6 +33,9 @@ requires:
   db:
     interface: mysql
     optional: true
+  shared-db:
+    interface: mysql-shared
+    optional: true
 
 provides:
   website:
