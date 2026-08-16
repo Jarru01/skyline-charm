@@ -26,6 +26,37 @@ design.
 
 ---
 
+## Status / To-do
+
+**Done & verified**
+
+- Fully offline install from bundled wheels (apiserver + console + pinned deps)
+- nginx config generated from the keystone catalog
+- Databases: local MariaDB; external DB via `database-url`; the HA path via a
+  `mysql-router` `shared-db` → `mysql-innodb-cluster` (incl. the Group
+  Replication primary-key fix — error 3098)
+- Uniform session `secret_key` shared across units over `skyline-peers`
+- Prometheus monitoring — set `prometheus-endpoint` and the console Monitor
+  pages are populated. Each unit queries the same Prometheus API
+  independently, so adding skyline units does **not** affect monitoring.
+- Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
+  `get-static-path`
+
+**Remaining / planned**
+
+- **Access layer (Phase 2):** HAProxy + Keepalived VIP (Horizon-style) in front
+  of the skyline units — the dashboard behind one floating IP with LB health
+  probes
+  - Probe hardening: `GET /` returns 200 even if the apiserver is down, so a
+    readiness endpoint (`/healthz`) reflecting apiserver + DB state is planned
+  - VIP on HTTP `:80` → backend `:9999` (TLS termination later)
+- **Multi-unit exercise:** scaling out is implemented (per-unit `mysql-router`
+  subordinates, cluster grants, uniform `secret_key`), but only one skyline
+  unit exists today — it must be smoke-tested (add-unit skyline → router
+  placement, grants, login on each unit) before Phase 2
+
+---
+
 ## Directory Layout
 
 ```
@@ -415,8 +446,10 @@ Two prerequisites are handled by the charm but worth verifying after scaling:
 2. **One uniform `secret_key`** — the leader publishes it over
    `skyline-peers`; check each unit with `juju run skyline show-config --wait`.
 
-Terminal sides are the access layer (HAProxy + Keepalived VIP, the pattern used
-for Horizon) and monitoring; both are out of scope of this charm.
+The remaining piece for full HA is the access layer: HAProxy + Keepalived VIP
+in front of the skyline units (see "Status / To-do" at the top of this file).
+Monitoring is already supported via `prometheus-endpoint` and is unaffected by
+scaling skyline.
 
 ---
 
