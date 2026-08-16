@@ -422,9 +422,11 @@ Notes:
   `/` → `%2F`, `:` → `%3A`, `%` → `%25`), e.g.
   `mysql://skyline:p%40ss%23word@10.0.0.5:3306/skyline`.
 - **Switching away from the local DB** (setting `database-url` on a unit that
-  previously used local MariaDB) leaves the local database and its data
-  untouched but no longer used — no data is migrated to the external server.
-  The installed local MariaDB keeps running until you remove it manually.
+  previously used local MariaDB, or relating the mysql-router) leaves the local
+  database and its data untouched but no longer used — no data is migrated to
+  the external server. The charm runs `systemctl disable --now mariadb`, so the
+  local service is stopped and disabled automatically (its package and data
+  files remain on disk until you remove them manually).
 
 ---
 
@@ -435,9 +437,20 @@ session tokens, no WebSockets), so you can run several units behind a load
 balancer without sticky sessions:
 
 ```bash
-juju relate skyline:shared-db skyline-mysql-router:shared-db   # shared cluster DB
-juju add-unit skyline -n 2                                     # same DB, same secret
+juju deploy ./skyline_ubuntu-22.04-amd64.charm \
+  --config keystone-url="https://KEYSTONE_IP:5000/v3/" \
+  --config system-user-password="SKYLINE_SERVICE_PASSWORD" \
+  --to lxd:1                       # NO database-url — the router drives the DB
+juju relate skyline:shared-db skyline-mysql-router:shared-db
+juju add-unit skyline -n 2         # same DB, same secret
 ```
+
+Related **once**, scaled freely: `mysql-router` is a *subordinate*, so every
+skyline unit automatically gets its own co-located router (and inherits the
+cluster/vault relationships) — there is nothing to relate per unit. The cluster
+provisions the `skyline` database and user once; the only per-scale item worth
+confirming is that each new unit's IP is covered by the DB grant (the smoke
+test listed in "Status / To-do").
 
 Two prerequisites are handled by the charm but worth verifying after scaling:
 
