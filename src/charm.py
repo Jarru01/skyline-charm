@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import textwrap
 import tarfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -360,12 +361,18 @@ class SkylineCharm(ops.CharmBase):
             "python3", "python3-pip", "python3-venv",
             "build-essential", "make",
             "nginx", "ssl-cert",
+            # client-only: used by charm-side schema checks (PK fix, leader
+            # migration polling); independent of which DB backend serves data
+            "mariadb-client",
         ])
         if self._using_local_db():
             self.unit.status = ops.MaintenanceStatus("Installing MariaDB")
+            # Package only — the service is started in _setup_local_mariadb().
+            # A freshly added unit cannot see its relations during the install
+            # hook, so starting (or even enabling) MariaDB here risks racing a
+            # co-located mysql-router subordinate for 127.0.0.1:3306 on units
+            # that are about to join the cluster path.
             self._apt_install(["mariadb-server"])
-            self._run(["systemctl", "enable", "mariadb"])
-            self._run(["systemctl", "start", "mariadb"])
 
     def _setup_venv(self):
         self.unit.status = ops.MaintenanceStatus("Creating Python virtualenv")
@@ -466,6 +473,9 @@ class SkylineCharm(ops.CharmBase):
 
     def _setup_local_mariadb(self):
         self.unit.status = ops.MaintenanceStatus("Configuring local MariaDB")
+        # Bring the service up here (not at package-install time) so units
+        # headed for the cluster path never hold 127.0.0.1:3306.
+        self._run(["systemctl", "enable", "--now", "mariadb"])
         db_pass = self._db_password()
         sql = textwrap.dedent(f"""\
             CREATE DATABASE IF NOT EXISTS skyline
@@ -527,11 +537,71 @@ class SkylineCharm(ops.CharmBase):
             f"{result.stdout.strip()}"
         )
 
+    def _wait_for_schema_ready(self, timeout: int = 600) -> bool:
+        """
+        Poll through the shared-db router until the leader's migration has
+        produced an ``alembic_version`` table (cold-start multi-unit safety).
+        """
+        shared = self._shared_db_data()
+        if not shared:
+            return True
+        env = self._venv_env()
+        env["MYSQL_PWD"] = shared["password"]
+        base = [
+            "mysql", "--no-defaults",
+            "-h", shared["host"],
+            "-P", shared["port"],
+            "-u", shared["username"],
+            "-N", "-B",
+        ]
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            result = self._run(
+                base
+                + [
+                    shared["database"],
+                    "-e",
+                    "SELECT version_num FROM alembic_version LIMIT 1",
+                ],
+                env=env,
+                capture=True,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                logger.info(
+                    "leader schema detected (alembic at %s)",
+                    result.stdout.strip(),
+                )
+                return True
+            time.sleep(10)
+        return False
+
     def _run_db_sync(self):
         self.unit.status = ops.MaintenanceStatus("Running database migration (db_sync)")
         self._verify_venv_deps()
+        gated = bool(self._shared_db_data()) and not self.unit.is_leader()
+        if gated:
+            # Cold-start safety: on a fresh multi-unit deployment every unit
+            # would race `alembic upgrade head` against the same empty schema
+            # through its own router; MySQL DDL is not transactional, so all
+            # but one fail with 'table already exists'. Non-leaders wait for
+            # the leader's migration, then run their own as a guaranteed no-op.
+            self.unit.status = ops.WaitingStatus(
+                "Waiting for leader to migrate database schema"
+            )
+            if not self._wait_for_schema_ready():
+                raise RuntimeError(
+                    "leader database migration not observed within timeout; "
+                    "re-run db-sync after the leader unit has finished"
+                )
         self._run(["make", "db_sync"], cwd=str(APISERVER_SRC), env=self._venv_env())
-        self._ensure_db_primary_keys()
+        if gated:
+            # Schema DDL (including the PK fix) is owned by the leader while
+            # the relation is active; racing it from non-leaders could throw
+            # duplicate-column errors.
+            logger.info("PK fix owned by leader unit; skipping here")
+        else:
+            self._ensure_db_primary_keys()
         logger.info("db_sync completed successfully.")
 
     def _ensure_db_primary_keys(self):

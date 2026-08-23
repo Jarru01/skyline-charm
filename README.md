@@ -50,10 +50,12 @@ design.
   - Probe hardening: `GET /` returns 200 even if the apiserver is down, so a
     readiness endpoint (`/healthz`) reflecting apiserver + DB state is planned
   - VIP on HTTP `:80` → backend `:9999` (TLS termination later)
-- **Multi-unit exercise:** scaling out is implemented (per-unit `mysql-router`
-  subordinates, cluster grants, uniform `secret_key`), but only one skyline
-  unit exists today — it must be smoke-tested (add-unit skyline → router
-  placement, grants, login on each unit) before Phase 2
+- **Multi-unit exercise:** scaling out is implemented and smoke-tested —
+  fresh units come up hands-off (no local MariaDB race, per-unit routers
+  bootstrap cleanly, per-host grants auto-created). Schema migrations are
+  **leader-gated**: non-leader units wait for the leader's `alembic` run, so a
+  cold-start deploy of several units at once cannot race DDL on the empty
+  schema.
 
 ---
 
