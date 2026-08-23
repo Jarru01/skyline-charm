@@ -82,12 +82,15 @@ class SkylineCharm(ops.CharmBase):
             secret_key="",
             db_password="",
             static_path="",
+            opened_port=0,
         )
         self.framework.observe(self.on.install,        self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.start,          self._on_start)
         self.framework.observe(self.on.upgrade_charm,  self._on_upgrade_charm)
 
+        self.framework.observe(self.on["shared-db"].relation_created,
+                               self._on_shared_db_created)
         self.framework.observe(self.on["shared-db"].relation_changed,
                                self._on_shared_db_changed)
         self.framework.observe(self.on["shared-db"].relation_broken,
@@ -209,8 +212,25 @@ class SkylineCharm(ops.CharmBase):
                 unit_data.update(want)
                 logger.info("published shared-db DB request: %s", want)
 
+    def _shared_db_related(self) -> bool:
+        """
+        True while at least one mysql-router unit is attached to the
+        ``shared-db`` relation (remote units present). A dying/detached
+        relation has no remote units, so detaching cleanly falls back to the
+        previous DB mode.
+        """
+        for rel in self.model.relations.get("shared-db") or []:
+            if rel.units:
+                return True
+        return False
+
     def _using_local_db(self) -> bool:
         if self._shared_db_data():
+            return False
+        if self._shared_db_related():
+            # A mysql-router subordinate is attached (credentials may still be
+            # in flight). Never fall back to a local MariaDB: it would race the
+            # router for 127.0.0.1:3306 and wedge its bootstrap.
             return False
         return not bool(self.config.get("database-url", "").strip())
 
@@ -629,6 +649,15 @@ class SkylineCharm(ops.CharmBase):
             return False
         self._publish_shared_db_request()
 
+        if self._shared_db_related() and not self._shared_db_data():
+            # Router attached but has not published credentials yet. Wait
+            # instead of configuring against a half-ready (or local) database.
+            self.unit.status = ops.WaitingStatus(
+                "Waiting for mysql-router to publish database credentials"
+            )
+            logger.info("shared-db attached without credentials; deferring configure")
+            return False
+
         self.unit.status = ops.MaintenanceStatus("Rendering configuration")
         self._ensure_directories()
 
@@ -676,6 +705,37 @@ class SkylineCharm(ops.CharmBase):
             self._run(["nginx", "-t"])
             self._run(["systemctl", "enable", "nginx"])
             self._run(["systemctl", "reload-or-restart", "nginx"])
+        self._open_listen_port()
+
+    def _open_listen_port(self):
+        """
+        Open ``listen-port`` in Juju (unit firewall bookkeeping) so the port is
+        listed in the `juju status` Ports column and exposed via `juju expose`
+        semantics. Idempotent; closes a previously opened port if the config
+        changed.
+        """
+        port = int(self.config["listen-port"])
+        previous = int(self._stored.opened_port or 0)
+        if previous and previous != port:
+            try:
+                self.unit.close_port("tcp", previous)
+            except Exception as exc:
+                logger.warning("could not close old port tcp/%s: %s", previous, exc)
+        if port != previous:
+            self.unit.open_port("tcp", port)
+            self._stored.opened_port = port
+            logger.info("Opened tcp/%s in juju", port)
+
+    def _on_shared_db_created(self, event: ops.RelationCreatedEvent):
+        """
+        A mysql-router subordinate was just attached. Free 127.0.0.1:3306
+        immediately — before any credentials appear — so the router's
+        bootstrap never races a freshly started local MariaDB for the port
+        (the failure mode that wedges scaled-out units with 'Failed to connect
+        to MySQL'). Idempotent and safe when mariadb is absent.
+        """
+        logger.info("shared-db relation created; freeing 127.0.0.1:3306 for the router")
+        self._run(["systemctl", "disable", "--now", "mariadb"], check=False)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

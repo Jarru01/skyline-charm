@@ -352,6 +352,13 @@ Expected integrations once healthy (`juju status --relations`):
    `127.0.0.1:3306`), re-renders `skyline.yaml` (`database_url` now points at
    `mysql://skyline:...@127.0.0.1:3306/skyline`) and re-runs `db_sync`.
 
+> **Ordering is handled:** the moment the `shared-db` relation is *created* the
+> charm frees `127.0.0.1:3306` and waits (`Waiting for mysql-router to publish
+> database credentials`) until credentials arrive — it never starts local
+> MariaDB once related, so scaled-out units never race the router's bootstrap.
+> The charm also opens `listen-port` in Juju, so it appears in the
+> `juju status` Ports column.
+
 **InnoDB Cluster primary-key note (error 3098)**
 
 Group Replication rejects *any* INSERT/UPDATE/DELETE on a table without a
