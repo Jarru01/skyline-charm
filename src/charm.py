@@ -70,6 +70,11 @@ GUNICORN_CONF_PATH = SKYLINE_CONF_DIR / "gunicorn.py"
 SKYLINE_YAML_PATH  = SKYLINE_CONF_DIR / "skyline.yaml"
 GENERATED_NGINX_PATH = SKYLINE_CONF_DIR / "nginx.conf.generated"
 
+# Local MariaDB TCP port. Deliberately outside the mysql-router's 3306-3309
+# range so a co-located router can always bind 3306 regardless of hook order.
+LOCAL_MARIADB_PORT = 13306
+MARIADB_CNF_PATH   = Path("/etc/mysql/mariadb.conf.d/60-skyline.cnf")
+
 
 class SkylineCharm(ops.CharmBase):
     """Juju charm deploying the OpenStack Skyline Dashboard."""
@@ -302,7 +307,11 @@ class SkylineCharm(ops.CharmBase):
             )
         if not self._using_local_db():
             return self.config["database-url"].strip()
-        return f"mysql://skyline:{self._db_password()}@localhost:3306/skyline"
+        # Local MariaDB is deliberately OFF the router's port range: it binds
+        # 127.0.0.1:13306 (see _setup_local_mariadb), leaving 127.0.0.1:3306
+        # to the co-located mysql-router subordinate. Hook timing can never
+        # put the two in each other's way.
+        return f"mysql://skyline:{self._db_password()}@localhost:{LOCAL_MARIADB_PORT}/skyline"
 
     def _keystone_url(self) -> str:
         url = self.config.get("keystone-url", "").strip().rstrip("/")
@@ -473,9 +482,35 @@ class SkylineCharm(ops.CharmBase):
 
     def _setup_local_mariadb(self):
         self.unit.status = ops.MaintenanceStatus("Configuring local MariaDB")
-        # Bring the service up here (not at package-install time) so units
-        # headed for the cluster path never hold 127.0.0.1:3306.
-        self._run(["systemctl", "enable", "--now", "mariadb"])
+        # Pin local MariaDB to 127.0.0.1:13306 (never the router's 3306) via a
+        # drop-in BEFORE bringing the service up. Written on every configure:
+        # idempotent, and the restart applies it to units that had started
+        # with the default port earlier.
+        was_active = (
+            self._run(
+                ["systemctl", "is-active", "--quiet", "mariadb"],
+                check=False,
+            ).returncode
+            == 0
+        )
+        MARIADB_CNF_PATH.write_text(
+            textwrap.dedent(
+                f"""\
+                # Managed by the skyline charm — do not edit.
+                # Keeps local MariaDB off TCP 3306 so the co-located
+                # mysql-router subordinate always owns it (3306-3309).
+                [mysqld]
+                bind-address = 127.0.0.1
+                port = {LOCAL_MARIADB_PORT}
+                """
+            ),
+            encoding="utf-8",
+        )
+        self._run(["systemctl", "enable", "mariadb"])
+        if was_active:
+            self._run(["systemctl", "restart", "mariadb"])
+        else:
+            self._run(["systemctl", "start", "mariadb"])
         db_pass = self._db_password()
         sql = textwrap.dedent(f"""\
             CREATE DATABASE IF NOT EXISTS skyline
@@ -487,8 +522,11 @@ class SkylineCharm(ops.CharmBase):
               IDENTIFIED BY '{db_pass}';
             FLUSH PRIVILEGES;
         """)
+        # Administers over the unix socket — independent of the TCP port.
         self._run(["mysql", "-u", "root"], input_data=sql.encode())
-        logger.info("MariaDB skyline database and user created/verified.")
+        logger.info(
+            "MariaDB local instance ready on 127.0.0.1:%s.", LOCAL_MARIADB_PORT
+        )
 
     def _ensure_directories(self):
         for d in [SKYLINE_CONF_DIR, SKYLINE_LOG_DIR, SKYLINE_POLICY_DIR]:
