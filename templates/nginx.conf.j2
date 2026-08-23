@@ -79,6 +79,22 @@ http {
         root {{ static_path }};
         index index.html;
 
+        # ── LB health endpoint (gunicorn liveness) ─────────────────────
+        # Load balancers probe GET /healthz. The apiserver has no public
+        # routes, so a live gunicorn answers 404, which is intercepted and
+        # rewritten to 200; a dead gunicorn makes nginx emit its own 502.
+        # The database is intentionally not probed: it is cluster-global,
+        # so a DB outage affects every backend identically.
+        location = /healthz {
+            proxy_pass http://skyline_apiserver/;
+            proxy_intercept_errors on;
+            error_page 404 = @healthy;
+            access_log off;
+        }
+        location @healthy {
+            return 200 "ok\n";
+        }
+
         # ── Skyline API ─────────────────────────────────────────────────
         # Trailing slash on proxy_pass replaces the matched /api/openstack/skyline/
         # prefix, so /api/openstack/skyline/api/v1/* -> /api/v1/* on the backend.

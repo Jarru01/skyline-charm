@@ -733,6 +733,7 @@ class SkylineCharm(ops.CharmBase):
                 "server unix:/var/lib/skyline/skyline.sock fail_timeout=0;",
                 "server 127.0.0.1:28000 fail_timeout=0;",
             )
+            content = self._inject_health_endpoint(content)
             NGINX_CONF_PATH.write_text(content, encoding="utf-8")
             logger.info(
                 "nginx.conf generated from keystone catalog -> %s", NGINX_CONF_PATH
@@ -749,6 +750,43 @@ class SkylineCharm(ops.CharmBase):
                 "nginx.conf.j2", NGINX_CONF_PATH, self._template_context()
             )
             return False
+
+    def _inject_health_endpoint(self, content: str) -> str:
+        """
+        Add a `GET /healthz` location to the generated nginx config so load
+        balancers can probe *this unit's* gunicorn liveness:
+
+        - apiserver up   -> it 404s the unknown path -> intercepted -> 200
+        - apiserver down -> nginx's own 502 passes through -> probe fails
+
+        The database is deliberately NOT probed: it is cluster-global, so a DB
+        outage takes every backend down together and per-unit removal would
+        not help. Marker-guarded so repeated regenerations stay idempotent.
+        """
+        marker = "# skyline-charm: lb health endpoint"
+        if marker in content:
+            return content
+        anchor = "location / {"
+        block = (
+            f"        {marker} (gunicorn liveness)\n"
+            "        location = /healthz {\n"
+            "            proxy_pass http://127.0.0.1:28000/;\n"
+            "            proxy_intercept_errors on;\n"
+            "            error_page 404 = @healthy;\n"
+            "            access_log off;\n"
+            "        }\n"
+            "        location @healthy {\n"
+            "            return 200 \"ok\\n\";\n"
+            "        }\n\n"
+        )
+        if anchor not in content:
+            logger.warning(
+                "nginx health endpoint not injected: no %r anchor found", anchor
+            )
+            return content
+        content = content.replace(anchor, block + anchor, 1)
+        logger.info("Injected /healthz lb-health endpoint into nginx config")
+        return content
 
     def _configure(self):
         error = self._missing_required_config()

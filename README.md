@@ -32,30 +32,31 @@ design.
 
 - Fully offline install from bundled wheels (apiserver + console + pinned deps)
 - nginx config generated from the keystone catalog
-- Databases: local MariaDB; external DB via `database-url`; the HA path via a
+- Databases: local MariaDB (binds `127.0.0.1:13306`, deliberately outside the
+  router's 3306–3309 range); external DB via `database-url`; the HA path via a
   `mysql-router` `shared-db` → `mysql-innodb-cluster` (incl. the Group
   Replication primary-key fix — error 3098)
 - Uniform session `secret_key` shared across units over `skyline-peers`
 - Prometheus monitoring — set `prometheus-endpoint` and the console Monitor
   pages are populated. Each unit queries the same Prometheus API
   independently, so adding skyline units does **not** affect monitoring.
+- **Multi-unit cold start:** three units deployed at once (`Step 5b`) complete
+  hands-off — routers bootstrap cleanly, transient Waiting statuses appear as
+  designed, exactly one unit runs the Alembic migration (leader-gated) while
+  the others follow no-op, per-host grants are auto-created. The single-node
+  local-DB path is separately validated end-to-end on `127.0.0.1:13306`.
+- **LB health endpoint:** `GET /healthz` reflects *this unit's* apiserver
+  liveness (200 up / 502 down), injected into both the generated and the
+  fallback nginx configs
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`
 
 **Remaining / planned**
 
-- **Access layer (Phase 2):** HAProxy + Keepalived VIP (Horizon-style) in front
-  of the skyline units — the dashboard behind one floating IP with LB health
-  probes
-  - Probe hardening: `GET /` returns 200 even if the apiserver is down, so a
-    readiness endpoint (`/healthz`) reflecting apiserver + DB state is planned
-  - VIP on HTTP `:80` → backend `:9999` (TLS termination later)
-- **Multi-unit exercise:** done & verified — a from-scratch deploy of three
-  units at once (`Step 5b`) completes hands-off: routers bootstrap cleanly,
-  transient Waiting statuses appear as designed, exactly one unit runs the
-  Alembic migration (leader-gated) with the others following no-op, per-host
-  grants are auto-created, and the single-node local-DB path is separately
-  validated on `127.0.0.1:13306`.
+- **Access layer (Phase 2):** HAProxy + Keepalived VIP (Horizon-style) in
+  front of the skyline units — the dashboard behind one floating IP, backends
+  probed with `GET /healthz`, VIP on HTTP `:80` → backend `:9999`
+  (TLS termination later)
 
 ---
 
@@ -125,6 +126,15 @@ template instead: the Skyline API keeps working, but OpenStack service pages
 return 404 until the config is regenerated. Fix with
 `juju run skyline regenerate-nginx` (or any `juju config` change) once
 keystone is reachable.
+
+The charm also injects a **load-balancer health endpoint** into the server
+block (generated and fallback alike): `GET /healthz` proxies a throwaway
+request to gunicorn and rewrites the apiserver's inevitable 404 into **200**;
+if gunicorn is down, nginx emits its own **502**. Load balancers should probe
+this instead of `/` — static console files are served even when the API
+backend is dead. The database is intentionally *not* part of the probe: it is
+cluster-global, so an outage affects every backend identically and per-unit
+removal would not help.
 
 ### Offline installation
 
@@ -507,10 +517,11 @@ juju add-unit skyline -n 2 --to lxd:0,lxd:1   # same DB, same secret
 
 Related **once**, scaled freely: `mysql-router` is a *subordinate*, so every
 skyline unit automatically gets its own co-located router (and inherits the
-cluster/vault relationships) — there is nothing to relate per unit. The cluster
-provisions the `skyline` database and user once; the only per-scale item worth
-confirming is that each new unit's IP is covered by the DB grant (the smoke
-test listed in "Status / To-do").
+cluster/vault relationships) — there is nothing to relate per unit. The
+cluster provisions the `skyline` database once and creates a per-host grant
+for each new unit automatically as its router checks in. The charm-side
+guarantees (relation-created frees port 3306, leader-gated migrations) hold
+for any unit count.
 
 Two prerequisites are handled by the charm but worth verifying after scaling:
 
@@ -520,9 +531,9 @@ Two prerequisites are handled by the charm but worth verifying after scaling:
    `skyline-peers`; check each unit with `juju run skyline show-config --wait`.
 
 The remaining piece for full HA is the access layer: HAProxy + Keepalived VIP
-in front of the skyline units (see "Status / To-do" at the top of this file).
-Monitoring is already supported via `prometheus-endpoint` and is unaffected by
-scaling skyline.
+in front of the skyline units, probing **`GET /healthz`** (see "Status /
+To-do" at the top of this file). Monitoring is already supported via
+`prometheus-endpoint` and is unaffected by scaling skyline.
 
 ---
 
@@ -597,6 +608,7 @@ return HTTP 500.
 
 **502 Bad Gateway (nginx up, gunicorn down).**
 ```bash
+curl -I http://127.0.0.1:9999/healthz   # 502 = gunicorn dead, 200 = alive
 ss -tlnp | grep 28000
 journalctl -u skyline-apiserver --no-pager -n 50
 ```
@@ -650,18 +662,24 @@ install
 config-changed  (fired automatically after install)
   ├─ validate keystone-url and system-user-password
   ├─ publish uniform secret_key to skyline-peers (leader)
-  ├─ create local MariaDB db/user (if no shared-db relation and database-url is empty)
-  │   (when a mysql-router shared-db relation IS present, stop/disable local
-  │    MariaDB instead so the router can bind 127.0.0.1:3306)
+  ├─ shared-db related but router credentials not published yet
+  │    → WaitingStatus, defer the rest of configure
+  ├─ create local MariaDB db/user on 127.0.0.1:13306 (if no shared-db
+  │    relation and database-url is empty; never started once related)
   ├─ render skyline.yaml, gunicorn.py, skyline-apiserver.service
   │    (database_url = shared-db relation > database-url config > local MariaDB)
-  ├─ GENERATE nginx.conf from the keystone catalog
+  ├─ GENERATE nginx.conf from the keystone catalog + inject GET /healthz
   │    (fallback to templates/nginx.conf.j2 if the generator fails)
   ├─ systemctl daemon-reload
-  ├─ make db_sync  (Alembic — idempotent)
-  │    └─ after: ensure InnoDB Cluster primary keys on revoked_token/settings
-  │         (idempotent ALTER; required for Group Replication writes, error 3098)
-  └─ enable + restart skyline-apiserver; nginx reload-or-restart
+  ├─ make db_sync  (Alembic)
+  │    ├─ cluster path, non-leader unit: wait for the leader's schema first
+  │    └─ leader then adds InnoDB Cluster primary keys on revoked_token /
+  │         settings (idempotent ALTER; Group Replication requirement, err 3098)
+  └─ enable + restart skyline-apiserver; nginx reload-or-restart;
+     open listen-port in juju (Ports column)
+
+shared-db relation-created
+  └─ stop/disable local MariaDB immediately (router owns 127.0.0.1:3306)
 
 shared-db relation-changed/broken
   └─ same re-render + db_sync path (switch to/from the router-provided DB)
