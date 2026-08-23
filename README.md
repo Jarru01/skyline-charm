@@ -7,7 +7,7 @@ container:
 |---|---|
 | skyline-apiserver | Python ASGI app, gunicorn on `127.0.0.1:28000` (loopback) |
 | skyline-console | Pre-built Python wheel, static assets served by nginx |
-| MariaDB | Local instance (optional — skipped if `database-url` is set or a `mysql-router` `shared-db` relation provides the DB) |
+| MariaDB | Local instance, binds `127.0.0.1:13306` (optional — skipped if `database-url` is set or a `mysql-router` `shared-db` relation provides the DB) |
 | nginx | Public listener, default port `9999` |
 
 Everything the unit needs is **bundled inside the charm** (`files/`):
@@ -211,6 +211,8 @@ openstack role add --project admin --user skyline admin
 
 ## Step 5 — Deploy
 
+### 5a — Single unit
+
 ```bash
 juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --config keystone-url="https://KEYSTONE_IP:5000/v3/" \
@@ -219,9 +221,50 @@ juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --to lxd:1
 ```
 
+With no `database-url` and no router relation, the charm installs and manages
+a **local MariaDB**. That instance deliberately binds **`127.0.0.1:13306`**,
+*not* 3306: the co-located `mysql-router` subordinate always owns
+`127.0.0.1:3306–3309`, so local DB and router can never collide regardless of
+hook ordering. Attaching a `mysql-router` `shared-db` relation later stops the
+local instance and moves the app to the cluster automatically.
+
 > **`prometheus-endpoint` must include the scheme** (`http://...`). A bare
 > `host:port` makes the apiserver return HTTP 500 and the Monitor pages show
 > no data.
+
+### 5b — Multiple units from scratch (HA cold start)
+
+Prerequisite: a healthy `mysql-innodb-cluster` + vault (see
+[Using an External Database](#using-an-external-database)). Deploy everything
+up front and wire the relations immediately — the same order a bundle would
+use:
+
+```bash
+juju deploy ./skyline_ubuntu-22.04-amd64.charm skyline \
+  --config keystone-url="https://KEYSTONE_IP:5000/v3/" \
+  --config system-user-password="THE_PASSWORD_YOU_SET_ABOVE" \
+  --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
+  -n 3 --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B
+juju deploy mysql-router skyline-mysql-router --channel 8.0/stable
+
+juju relate skyline-mysql-router:db-router    mysql-innodb-cluster:db-router
+juju relate skyline-mysql-router:certificates vault:certificates
+juju relate skyline:shared-db                 skyline-mysql-router:shared-db
+```
+
+Notes:
+
+- **`--to` is mandatory on MAAS** — without placement directives Juju asks
+  MAAS for brand-new machines and hangs on *"waiting for machine"*. Give one
+  directive per unit and spread them across machines for real HA.
+- Relating while the units are still installing gives the cleanest ordering;
+  relating later also works.
+- Expected transient statuses during bring-up:
+  - `Waiting for mysql-router to publish database credentials` — router still
+    bootstrapping against the cluster
+  - `Waiting for leader to migrate database schema` on non-leader units —
+    exactly **one** unit runs the real Alembic migration, the rest follow
+    with a no-op, so parallel cold starts can never race DDL
 
 ## Step 6 — Watch the deployment
 
@@ -443,7 +486,8 @@ Notes:
 
 Skyline backends are **stateless** (gunicorn ASGI on `127.0.0.1:28000`, signed
 session tokens, no WebSockets), so you can run several units behind a load
-balancer without sticky sessions:
+balancer without sticky sessions. (To stand up several units at once from
+nothing, use the cold-start recipe in **Step 5b** instead.)
 
 ```bash
 juju deploy ./skyline_ubuntu-22.04-amd64.charm \
