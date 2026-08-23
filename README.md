@@ -50,12 +50,12 @@ design.
   - Probe hardening: `GET /` returns 200 even if the apiserver is down, so a
     readiness endpoint (`/healthz`) reflecting apiserver + DB state is planned
   - VIP on HTTP `:80` → backend `:9999` (TLS termination later)
-- **Multi-unit exercise:** scaling out is implemented and smoke-tested —
-  fresh units come up hands-off (no local MariaDB race, per-unit routers
-  bootstrap cleanly, per-host grants auto-created). Schema migrations are
-  **leader-gated**: non-leader units wait for the leader's `alembic` run, so a
-  cold-start deploy of several units at once cannot race DDL on the empty
-  schema.
+- **Multi-unit exercise:** done & verified — a from-scratch deploy of three
+  units at once (`Step 5b`) completes hands-off: routers bootstrap cleanly,
+  transient Waiting statuses appear as designed, exactly one unit runs the
+  Alembic migration (leader-gated) with the others following no-op, per-host
+  grants are auto-created, and the single-node local-DB path is separately
+  validated on `127.0.0.1:13306`.
 
 ---
 
