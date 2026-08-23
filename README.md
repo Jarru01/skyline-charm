@@ -449,8 +449,15 @@ juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --config system-user-password="SKYLINE_SERVICE_PASSWORD" \
   --to lxd:1                       # NO database-url — the router drives the DB
 juju relate skyline:shared-db skyline-mysql-router:shared-db
-juju add-unit skyline -n 2         # same DB, same secret
+juju add-unit skyline -n 2 --to lxd:0,lxd:1   # same DB, same secret
 ```
+
+> **`--to` is mandatory on MAAS.** Without a placement directive, `juju
+> add-unit` asks MAAS for *brand-new machines* (and hangs forever on
+> "waiting for machine" when the pool is empty). `--to lxd:0,lxd:1` puts each
+> new unit into an LXD container on an existing machine — one per host, so the
+> units span two physical nodes for real HA. Match the number of directives to
+> `-n`.
 
 Related **once**, scaled freely: `mysql-router` is a *subordinate*, so every
 skyline unit automatically gets its own co-located router (and inherits the
