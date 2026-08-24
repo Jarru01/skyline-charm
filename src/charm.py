@@ -104,6 +104,11 @@ class SkylineCharm(ops.CharmBase):
         self.framework.observe(self.on["skyline-peers"].relation_changed,
                                self._on_peers_changed)
 
+        self.framework.observe(self.on["website"].relation_joined,
+                               self._on_website_joined)
+        self.framework.observe(self.on["website"].relation_changed,
+                               self._on_website_changed)
+
         self.framework.observe(self.on.db_sync_action,          self._on_action_db_sync)
         self.framework.observe(self.on.get_static_path_action,  self._on_action_get_static_path)
         self.framework.observe(self.on.restart_services_action, self._on_action_restart_services)
@@ -835,6 +840,10 @@ class SkylineCharm(ops.CharmBase):
         self._run(["systemctl", "daemon-reload"])
         self._run_db_sync()
         self._restart_services(nginx=nginx_ready)
+
+        for rel in self.model.relations.get("website", []):
+            self._publish_website(rel)
+
         return True
 
     def _restart_services(self, nginx: bool = True):
@@ -994,6 +1003,25 @@ class SkylineCharm(ops.CharmBase):
         except Exception as exc:
             logger.exception("peer relation handler failed")
             self.unit.status = ops.BlockedStatus(f"Peers error: {exc}")
+
+    # ── Website relation (HAProxy backend discovery) ─────────────────────────
+
+    def _on_website_joined(self, event: ops.RelationJoinedEvent):
+        self._publish_website(event.relation)
+
+    def _on_website_changed(self, event: ops.RelationChangedEvent):
+        self._publish_website(event.relation)
+
+    def _publish_website(self, relation: ops.Relation):
+        binding = self.model.get_binding(relation)
+        ingress = str(binding.network.ingress_address) if binding else ""
+        port = str(self.config["listen-port"])
+        relation.data[self.unit].update({
+            "hostname": ingress,
+            "private-address": ingress,
+            "port": port,
+        })
+        logger.info("Published website endpoint: %s:%s", ingress, port)
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
