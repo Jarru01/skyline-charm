@@ -254,13 +254,15 @@ juju deploy ./skyline_ubuntu-22.04-amd64.charm skyline \
   -n 3 --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B
 juju deploy mysql-router skyline-mysql-router --channel 8.0/stable
 
-juju relate skyline-mysql-router:db-router    mysql-innodb-cluster:db-router
-juju relate skyline-mysql-router:certificates vault:certificates
-juju relate skyline:shared-db                 skyline-mysql-router:shared-db
+juju integrate skyline-mysql-router:db-router    mysql-innodb-cluster:db-router
+juju integrate skyline-mysql-router:certificates vault:certificates
+juju integrate skyline:shared-db                 skyline-mysql-router:shared-db
 ```
 
 Notes:
 
+- **`integrate` vs `relate`:** both work on Juju 3.x — `relate` is kept as a
+  legacy alias of `integrate`. This guide standardizes on `integrate`.
 - **`--to` is mandatory on MAAS** — without placement directives Juju asks
   MAAS for brand-new machines and hangs on *"waiting for machine"*. Give one
   directive per unit and spread them across machines for real HA.
@@ -366,7 +368,7 @@ router certificates. If you are starting from scratch:
 
 ```bash
 juju deploy --channel 8.0/stable mysql-innodb-cluster --to lxd:0       # 3 units via -n 3
-juju relate mysql-innodb-cluster:vault vault:certificates              # router TLS chain
+juju integrate mysql-innodb-cluster:vault vault:certificates              # router TLS chain
 # wait until: "Unit is ready: Mode: R/W, Cluster is ONLINE and can tolerate up to ONE failure."
 ```
 
@@ -379,9 +381,9 @@ juju deploy mysql-router skyline-mysql-router --channel 8.0/stable
 **Step 2 — Wire up the relations (all three are required)**
 
 ```bash
-juju relate skyline-mysql-router:db-router     mysql-innodb-cluster:db-router
-juju relate skyline-mysql-router:certificates  vault:certificates
-juju relate skyline:shared-db                  skyline-mysql-router:shared-db
+juju integrate skyline-mysql-router:db-router     mysql-innodb-cluster:db-router
+juju integrate skyline-mysql-router:certificates  vault:certificates
+juju integrate skyline:shared-db                  skyline-mysql-router:shared-db
 ```
 
 Expected integrations once healthy (`juju status --relations`):
@@ -501,7 +503,7 @@ juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --config keystone-url="https://KEYSTONE_IP:5000/v3/" \
   --config system-user-password="SKYLINE_SERVICE_PASSWORD" \
   --to lxd:1                       # NO database-url — the router drives the DB
-juju relate skyline:shared-db skyline-mysql-router:shared-db
+juju integrate skyline:shared-db skyline-mysql-router:shared-db
 juju add-unit skyline -n 2 --to lxd:0,lxd:1   # same DB, same secret
 ```
 
@@ -533,27 +535,56 @@ The skyline units sit behind an HAProxy access layer with a Keepalived-managed
 VIP, fully Juju-configured (no manual `haproxy.cfg` edits):
 
 ```bash
-# 1) haproxy application — listener + health-check policy via charm config.
-#    NOTE: the value must be valid YAML; quote every scalar containing
-#    braces/spaces (an unquoted '{i}' breaks yaml.safe_load in the hook).
-juju deploy haproxy --channel latest/stable -n 3 \
-  --config enable_monitoring=true
-juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 80, "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s"], "server_options": "check inter 10s rise 2 fall 3"}]'
+# 0) Reserve the VIP in MAAS first: static reservation in the same subnet /
+#    VLAN as the unit addresses (here 10.11.1.200 on 10.11.0.0/16), so no
+#    other machine can claim it and VRRP can move it freely.
 
-# 2) keepalived subordinate on each haproxy unit + VIP
+# 1) HAProxy application — spread across machines like skyline
+juju deploy haproxy --channel latest/stable -n 3 \
+  --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B \
+  --config enable_monitoring=true
+
+# 2) Keepalived subordinate on every haproxy unit + the VIP
 juju deploy keepalived --channel latest/stable \
   --config virtual_ip=10.11.1.200
 juju integrate keepalived:juju-info haproxy:juju-info
 
-# 3) backends: each skyline unit publishes address+port over the website
-#    relation; haproxy adds/removes them automatically on scale-out/in
+# 3) Backends — each skyline unit publishes address+port over the website
+#    relation; haproxy adds/removes them automatically on scale-out/in.
+#    Needs a skyline charm revision that has the `website` endpoint.
 juju integrate skyline:website haproxy:reverseproxy
+
+# 4) Listener + health-check policy, set via charm config.
+#    NOTE: the value must be valid YAML; quote every scalar containing
+#    braces/spaces (an unquoted '{i}' breaks yaml.safe_load in the hook).
+juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 80, "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s"], "server_options": "check inter 10s rise 2 fall 3"}]'
+```
+
+> **Legacy haproxy charm quirks (`latest/stable`, rev 147):** while it has no
+> backends yet (no relation / no `services` config), its hook exits with
+> *"No backend servers"* and units show `hook failed: config-changed` — this
+> is expected mid-setup and clears once steps 3+4 are in place. If a unit is
+> stuck in `error` afterwards, `juju resolve haproxy/0` (etc.) lets the
+> queued hook re-run. Also, on Juju 3.6 the initial `config-changed` may not
+> fire at all after install until one of the events above triggers it — the
+> same resolve clears that too.
+
+Verify:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://10.11.1.200/healthz   # 200
+curl -s -o /dev/null -w '%{http_code}\n' http://10.11.1.200/          # 200
+
+# per-unit backend status (stats are localhost-only by default):
+juju ssh haproxy/0
+CREDS=$(grep 'stats auth' /etc/haproxy/haproxy.cfg | awk '{print $3}')
+curl -s -u "$CREDS" 'http://127.0.0.1:10000/;csv' | grep '^skyline_be' | cut -d, -f2,18
 ```
 
 Rendered topology (per unit): `:80` tcp → peer haproxy units on `:81`
 (active/backup), `:81` http → `skyline_be` = all skyline units with
 `httpchk GET /healthz` (`inter 10s rise 2 fall 3`). Stats on `:10000`
-(localhost-only by default). The VIP must be reserved in MAAS first.
+(localhost-only by default).
 
 ### Failover test results (T1–T5)
 
