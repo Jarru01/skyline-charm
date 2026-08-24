@@ -48,6 +48,11 @@ design.
 - **LB health endpoint:** `GET /healthz` reflects *this unit's* apiserver
   liveness (200 up / 502 down), injected into both the generated and the
   fallback nginx configs
+- **Website relation:** every unit publishes its ingress address +
+  `listen-port` on the `website` endpoint (`interface: http`, declared in
+  `charmcraft.yaml`). HAProxy consumes this via its `reverseproxy` side and
+  discovers/removes backends automatically — no static server lists anywhere
+  (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`
 
@@ -752,6 +757,12 @@ shared-db relation-changed/broken
 
 skyline-peers relation-changed (new unit / rotated secret_key)
   └─ re-render with the leader-published key
+
+website relation-joined/changed  (+ re-publish after every successful
+│                                   configure, e.g. listen-port change)
+  └─ publish {hostname, private-address, port} = this unit's ingress
+       address + listen-port → HAProxy (reverseproxy) picks it up as a
+       backend server with health checks
 
 start
   └─ confirm skyline-apiserver is active → set ActiveStatus
