@@ -53,10 +53,7 @@ design.
 
 **Remaining / planned**
 
-- **Access layer (Phase 2):** HAProxy + Keepalived VIP (Horizon-style) in
-  front of the skyline units — the dashboard behind one floating IP, backends
-  probed with `GET /healthz`, VIP on HTTP `:80` → backend `:9999`
-  (TLS termination later)
+- **TLS termination** at the access layer (VIP currently HTTP `:80` only)
 
 ---
 
@@ -530,10 +527,48 @@ Two prerequisites are handled by the charm but worth verifying after scaling:
 2. **One uniform `secret_key`** — the leader publishes it over
    `skyline-peers`; check each unit with `juju run skyline show-config --wait`.
 
-The remaining piece for full HA is the access layer: HAProxy + Keepalived VIP
-in front of the skyline units, probing **`GET /healthz`** (see "Status /
-To-do" at the top of this file). Monitoring is already supported via
-`prometheus-endpoint` and is unaffected by scaling skyline.
+## Access layer (Phase 2): HAProxy + Keepalived VIP
+
+The skyline units sit behind an HAProxy access layer with a Keepalived-managed
+VIP, fully Juju-configured (no manual `haproxy.cfg` edits):
+
+```bash
+# 1) haproxy application — listener + health-check policy via charm config.
+#    NOTE: the value must be valid YAML; quote every scalar containing
+#    braces/spaces (an unquoted '{i}' breaks yaml.safe_load in the hook).
+juju deploy haproxy --channel latest/stable -n 3 \
+  --config enable_monitoring=true
+juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 80, "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s"], "server_options": "check inter 10s rise 2 fall 3"}]'
+
+# 2) keepalived subordinate on each haproxy unit + VIP
+juju deploy keepalived --channel latest/stable \
+  --config virtual_ip=10.11.1.200
+juju integrate keepalived:juju-info haproxy:juju-info
+
+# 3) backends: each skyline unit publishes address+port over the website
+#    relation; haproxy adds/removes them automatically on scale-out/in
+juju integrate skyline:website haproxy:reverseproxy
+```
+
+Rendered topology (per unit): `:80` tcp → peer haproxy units on `:81`
+(active/backup), `:81` http → `skyline_be` = all skyline units with
+`httpchk GET /healthz` (`inter 10s rise 2 fall 3`). Stats on `:10000`
+(localhost-only by default). The VIP must be reserved in MAAS first.
+
+### Failover test results (T1–T5)
+
+Measured with a client loop hitting `http://10.11.1.200/healthz` every ~0.27 s.
+
+| Test | Scenario | Result |
+|---|---|---|
+| T1 | Backend outage (`systemctl stop nginx` on one skyline unit) | Marked DOWN after ~24 s (`fall 3 × inter 10s`); 9/147 requests failed during detection window; service continued on remaining 2 units |
+| T2 | Backend recovery (`systemctl start nginx`) | Re-entered rotation (~20 s, `rise 2 × inter 10s`); **0** user-visible failures |
+| T3 | VIP MASTER outage (`systemctl stop keepalived` on haproxy/3) | VIP failed over to haproxy/4; **~1.5 s** interruption, exactly **1** dropped request |
+| T4 | Original master returns (`start keepalived`) | VIP returned to haproxy/3 (preempt); **0/96** failures during fail-back |
+| T5 | Non-VIP haproxy unit outage (`stop haproxy` on haproxy/4) | Peer tier marked it DOWN; VIP unaffected; **0** failures / 80 requests served; UP again after restart |
+
+All acceptance criteria from the reference design are met; failover time is
+well under the ~9 s observed there.
 
 ---
 
