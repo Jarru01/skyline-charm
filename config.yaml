@@ -18,6 +18,9 @@ options:
       Create it with:
         openstack user create --domain admin_domain --password-prompt skyline
         openstack role add --project admin --user skyline admin
+        openstack role add --user skyline --user-domain admin_domain --system all Admin
+      The system-scope grant is required by system-scoped admin APIs;
+      without it some administrator panels return 403 / empty data.
 
   # ── Database ──────────────────────────────────────────────────────────
   database-url:

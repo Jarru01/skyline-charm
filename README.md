@@ -220,9 +220,9 @@ openstack user create \
 
 openstack role add --project admin --user skyline admin
 
-# Optional: some system-scoped admin APIs reject project-scoped tokens.
-# Only needed if specific admin panels return 403 / empty data:
-# openstack role add --user skyline --user-domain admin_domain --system all Admin
+# System-scope grant: required by system-scoped admin APIs. Without it,
+# some administrator panels return 403 / empty data.
+openstack role add --user skyline --user-domain admin_domain --system all Admin
 ```
 
 ## Step 5 — Deploy
