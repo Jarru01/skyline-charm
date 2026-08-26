@@ -385,7 +385,9 @@ config time (idempotent — safe to run repeatedly):
    `TypeError: Cannot destructure property 'left' of undefined`. The error
    is caught by the layout's `renderChildren` try/catch and shows
    "Error, Unable to get Data, please go to Home page". The fix replaces
-   `{left:l=0}=r;` with `{left:l=0}=r||{};` in the minified bundle.
+   ALL occurrences of `{left:l=0}=r;` with `{left:l=0}=r||{};` in the
+   minified bundle (not just the first match — there are multiple instances
+   of this pattern).
 
    **Why Create Cluster Templates are unaffected:** The Template create page
    (`/container-infra/clusterTemplate/create`) only calls `getDetail()` in
@@ -398,6 +400,14 @@ config time (idempotent — safe to run repeatedly):
    `templates/nginx.conf.j2` instead of blocking the Juju hook forever.
    Previously, a hung generator would leave units stuck in
    `MaintenanceStatus("Generating nginx config from keystone catalog")`.
+
+3. **Static-asset cache-control:** The charm injects a `location ~*` block
+   into the generated nginx config with `Cache-Control: public, must-revalidate`
+   (7-day expiry). This ensures browsers always revalidate static files
+   with the server via ETag/Last-Modified before using a cached copy. This
+   is critical because the charm patches bundle JS files in-place (same
+   filename), so without `must-revalidate`, browsers would serve stale
+   cached versions until the expiry elapsed.
 
 ---
 
@@ -757,6 +767,11 @@ at config time. If you see it on a pre-patch deployment:
 juju run skyline patch-frontend --wait
 # then hard-refresh the browser (Ctrl+Shift+R)
 ```
+If the error persists after patching, it may be a browser cache issue. The
+charm uses `must-revalidate` cache headers, but older deployments may have
+`immutable` headers. Clear the browser cache manually (Ctrl+Shift+Delete)
+and hard-refresh, or run `juju run skyline regenerate-nginx --wait` to
+update the nginx config with the correct cache headers.
 
 ---
 
