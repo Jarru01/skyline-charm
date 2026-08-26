@@ -314,6 +314,20 @@ Open `http://<UNIT_IP>:9999` in a browser.
 
 ---
 
+## Post-deploy: new OpenStack services
+
+The charm generates one nginx `location` block per service in the Keystone
+catalog **at deploy time**. If you deploy additional services (Magnum, Heat,
+Barbican, etc.) *after* Skyline, their pages will return the SPA fallback until
+you regenerate the config:
+
+```bash
+juju run skyline regenerate-nginx --wait
+```
+
+Do this on every catalogue change — new services, removed endpoints, or
+service-url updates.
+
 ## Configuration Reference
 
 | Key | Default | Description |
