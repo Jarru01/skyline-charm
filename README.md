@@ -55,6 +55,8 @@ design.
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`, `patch-frontend`
+- **Unit tests:** 75 tests covering helpers, nginx injection, JS patching,
+  actions, lifecycle events, and relations (run with `py -3 -m pytest tests/`)
 
 **Remaining / planned**
 
@@ -93,6 +95,10 @@ skyline-charm/
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
 │   │   offline_proof.sh, check_db.sh
 │   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
+├── tests/                             # unit tests (offline, 75 tests)
+│   ├── conftest.py                    #   harness fixtures
+│   ├── helpers.py                     #   shared test utilities
+│   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config tests
 └── skyline_ubuntu-22.04-amd64.charm   # built artifact (git-ignored)
 ```
 
