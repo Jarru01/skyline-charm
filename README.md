@@ -860,3 +860,19 @@ juju config skyline secret-key=NEW_VALUE   # rotate — invalidates all sessions
 
 Verify uniformity across units with `juju run skyline show-config --wait` on
 each one.
+
+## Testing
+
+75 local unit tests cover the charm's logic layer — helper functions, nginx
+injection, JS bundle patching, action handlers, lifecycle events, and relation
+handlers. They run entirely offline (no Juju/MAAS required) and mock all
+subprocess calls.
+
+```bash
+py -3 -m pip install "ops>=2.9.0" jinja2 pytest   # one-time
+py -3 -m pytest tests/ -v
+```
+
+Tests do **not** verify real filesystem paths, template rendering, or
+deployed-cluster behaviour. For full confidence, deploy to a test model and
+run the smoke checks from the sections above.
