@@ -487,7 +487,6 @@ class SkylineCharm(ops.CharmBase):
         self._stored.static_path = result.stdout.strip()
         logger.info("Console static path: %s", self._stored.static_path)
         self._patch_container_infra_bundle()
-        self._inject_error_logger()
 
     def _patch_container_infra_bundle(self):
         """Patch container-infra bundle JS to fix checkVolumeQuota TypeError.
@@ -555,50 +554,6 @@ class SkylineCharm(ops.CharmBase):
                     logger.warning("Could not remove %s: %s", gz, exc)
         if patched:
             logger.info("Patched %d container-infra bundle(s) — nginx reload recommended", patched)
-
-    def _inject_error_logger(self):
-        """Inject a JS error-capture script into index.html for debugging.
-
-        The Skyline console uses React error boundaries that silently catch
-        render errors and show 'Unable to get Data, please go to Home page'.
-        This injector adds a script that logs ALL errors (including those
-        caught by error boundaries) to ``window.__skylineErrors`` and also
-        to ``console.error`` with a visible ``[SKYLINE-ERR]`` prefix.
-
-        Idempotent — checks for the marker before injecting.
-        """
-        static = self._stored.static_path
-        if not static:
-            return
-        index = Path(static) / "index.html"
-        if not index.exists():
-            return
-        try:
-            html = index.read_text(encoding="utf-8")
-        except Exception:
-            return
-        marker = "window.__skylineErrors"
-        if marker in html:
-            return
-        logger_script = (
-            '<script>'
-            'window.__skylineErrors=[];'
-            'window.addEventListener("error",function(e){'
-            'window.__skylineErrors.push({t:new Date().toISOString(),m:e.message,'
-            's:e.filename,l:e.lineno,c:e.colno});'
-            'console.error("[SKYLINE-ERR]",e.message,"at",e.filename+":"+e.lineno);'
-            '});'
-            'window.addEventListener("unhandledrejection",function(e){'
-            'var r=e.reason||{};'
-            'window.__skylineErrors.push({t:new Date().toISOString(),m:"UnhandledPromise",'
-            'd:String(r.message||r)});'
-            'console.error("[SKYLINE-ERR] UnhandledPromise",r.message||r);'
-            '});'
-            '</script>'
-        )
-        html = html.replace("</head>", logger_script + "\n</head>")
-        index.write_text(html, encoding="utf-8")
-        logger.info("Injected error-logger into index.html")
 
     # ── Database ─────────────────────────────────────────────────────────────
 
@@ -964,7 +919,6 @@ class SkylineCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(error)
             return False
         self._patch_container_infra_bundle()
-        self._inject_error_logger()
         self._publish_shared_db_request()
 
         if self._shared_db_related() and not self._shared_db_data():
