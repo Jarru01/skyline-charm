@@ -499,7 +499,16 @@ class SkylineCharm(ops.CharmBase):
         shows "Error, Unable to get Data, please go to Home page" on the
         Create Cluster page.
 
-        Fix: ``{left:l=0}=r`` -> ``{left:l=0}=r||{}``
+        Fix: ``{left:l=0}=r;`` -> ``{left:l=0}=r||{};`` (all occurrences)
+
+        Replaces ALL occurrences because the same minified pattern appears in
+        both checkInstanceQuota (harmless) and checkVolumeQuota (the actual
+        bug). The V2 marker forces re-patch on files that were incorrectly
+        patched by V1 (which only patched the first occurrence, hitting the
+        wrong one).
+
+        Also removes stale .gz companion files so nginx serves the patched
+        .js files instead of the pre-compressed unpatched originals.
 
         Idempotent — the patch marker is embedded so subsequent runs are
         no-ops.
@@ -507,7 +516,7 @@ class SkylineCharm(ops.CharmBase):
         static = self._stored.static_path
         if not static:
             return
-        marker = "VOL_QUOTA_PATCHED_V1"
+        marker = "VOL_QUOTA_PATCHED_V2"
         bad = "{left:l=0}=r;"
         good = "{left:l=0}=r||{};"
         patched = 0
@@ -519,21 +528,30 @@ class SkylineCharm(ops.CharmBase):
                 logger.warning("Could not read %s", bundle_file)
                 continue
             if marker in text:
-                logger.debug("container-infra bundle already patched: %s", bundle_file.name)
+                logger.debug("container-infra bundle already patched (V2): %s", bundle_file.name)
                 continue
             if bad not in text:
                 logger.info("Patch target not found in %s (may already be fixed upstream)", bundle_file.name)
                 continue
-            text = text.replace(bad, good, 1)
-            text = text.replace(
-                "// PATCHED: " + marker,
-                "",
-            )
-            # Append marker comment so we skip this file next time
+            # Strip any stale V1 marker before re-patching
+            text = text.replace("// PATCHED: VOL_QUOTA_PATCHED_V1\n", "")
+            count = text.count(bad)
+            text = text.replace(bad, good)
+            # Remove any old marker, append fresh V2 marker
+            text = text.replace(f"\n// PATCHED: {marker}\n", "")
             text += f"\n// PATCHED: {marker}\n"
             bundle_file.write_text(text, encoding="utf-8")
             patched += 1
-            logger.info("Patched container-infra bundle: %s", bundle_file.name)
+            logger.info("Patched container-infra bundle (%d occurrences): %s", count, bundle_file.name)
+            # Remove stale .gz companion — nginx would serve the pre-compressed
+            # unpatched version via gzip_static instead of the patched .js
+            gz = bundle_file.with_suffix(bundle_file.suffix + ".gz")
+            if gz.exists():
+                try:
+                    gz.unlink()
+                    logger.info("Removed stale gzip companion: %s", gz.name)
+                except Exception as exc:
+                    logger.warning("Could not remove %s: %s", gz, exc)
         if patched:
             logger.info("Patched %d container-infra bundle(s) — nginx reload recommended", patched)
 
@@ -1152,7 +1170,7 @@ class SkylineCharm(ops.CharmBase):
             if not static:
                 event.fail("static_path not discovered yet")
                 return
-            marker = "VOL_QUOTA_PATCHED_V1"
+            marker = "VOL_QUOTA_PATCHED_V2"
             bad = "{left:l=0}=r;"
             good = "{left:l=0}=r||{};"
             patched = 0
@@ -1165,10 +1183,19 @@ class SkylineCharm(ops.CharmBase):
                 if bad not in text:
                     skipped += 1
                     continue
-                text = text.replace(bad, good, 1)
+                text = text.replace("// PATCHED: VOL_QUOTA_PATCHED_V1\n", "")
+                count = text.count(bad)
+                text = text.replace(bad, good)
+                text = text.replace(f"\n// PATCHED: {marker}\n", "")
                 text += f"\n// PATCHED: {marker}\n"
                 bundle_file.write_text(text, encoding="utf-8")
                 patched += 1
+                gz = bundle_file.with_suffix(bundle_file.suffix + ".gz")
+                if gz.exists():
+                    try:
+                        gz.unlink()
+                    except Exception:
+                        pass
             event.set_results({
                 "patched": patched,
                 "skipped": skipped,
