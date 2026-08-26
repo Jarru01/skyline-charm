@@ -487,6 +487,7 @@ class SkylineCharm(ops.CharmBase):
         self._stored.static_path = result.stdout.strip()
         logger.info("Console static path: %s", self._stored.static_path)
         self._patch_container_infra_bundle()
+        self._inject_error_logger()
 
     def _patch_container_infra_bundle(self):
         """Patch container-infra bundle JS to fix checkVolumeQuota TypeError.
@@ -554,6 +555,50 @@ class SkylineCharm(ops.CharmBase):
                     logger.warning("Could not remove %s: %s", gz, exc)
         if patched:
             logger.info("Patched %d container-infra bundle(s) — nginx reload recommended", patched)
+
+    def _inject_error_logger(self):
+        """Inject a JS error-capture script into index.html for debugging.
+
+        The Skyline console uses React error boundaries that silently catch
+        render errors and show 'Unable to get Data, please go to Home page'.
+        This injector adds a script that logs ALL errors (including those
+        caught by error boundaries) to ``window.__skylineErrors`` and also
+        to ``console.error`` with a visible ``[SKYLINE-ERR]`` prefix.
+
+        Idempotent — checks for the marker before injecting.
+        """
+        static = self._stored.static_path
+        if not static:
+            return
+        index = Path(static) / "index.html"
+        if not index.exists():
+            return
+        try:
+            html = index.read_text(encoding="utf-8")
+        except Exception:
+            return
+        marker = "window.__skylineErrors"
+        if marker in html:
+            return
+        logger_script = (
+            '<script>'
+            'window.__skylineErrors=[];'
+            'window.addEventListener("error",function(e){'
+            'window.__skylineErrors.push({t:new Date().toISOString(),m:e.message,'
+            's:e.filename,l:e.lineno,c:e.colno});'
+            'console.error("[SKYLINE-ERR]",e.message,"at",e.filename+":"+e.lineno);'
+            '});'
+            'window.addEventListener("unhandledrejection",function(e){'
+            'var r=e.reason||{};'
+            'window.__skylineErrors.push({t:new Date().toISOString(),m:"UnhandledPromise",'
+            'd:String(r.message||r)});'
+            'console.error("[SKYLINE-ERR] UnhandledPromise",r.message||r);'
+            '});'
+            '</script>'
+        )
+        html = html.replace("</head>", logger_script + "\n</head>")
+        index.write_text(html, encoding="utf-8")
+        logger.info("Injected error-logger into index.html")
 
     # ── Database ─────────────────────────────────────────────────────────────
 
@@ -812,6 +857,7 @@ class SkylineCharm(ops.CharmBase):
                 "server 127.0.0.1:28000 fail_timeout=0;",
             )
             content = self._inject_health_endpoint(content)
+            content = self._inject_static_cache_control(content)
             NGINX_CONF_PATH.write_text(content, encoding="utf-8")
             logger.info(
                 "nginx.conf generated from keystone catalog -> %s", NGINX_CONF_PATH
@@ -877,12 +923,48 @@ class SkylineCharm(ops.CharmBase):
         logger.info("Injected /healthz lb-health endpoint into nginx config")
         return content
 
+    def _inject_static_cache_control(self, content: str) -> str:
+        """Post-process generated nginx.conf to add static-asset cache headers.
+
+        The upstream skyline-nginx-generator emits a bare ``location /`` block
+        that serves index.html AND static JS/CSS/images with ``Cache-Control
+        "public"`` and ``expires 1d``. The charm patches some bundle JS files
+        in-place (without changing the filename), so a browser that cached the
+        old file will continue serving stale code until the 1-day expiry.
+
+        This injector adds a ``location ~*`` block for static assets with
+        ``must-revalidate`` so the browser always checks the server (via ETag /
+        Last-Modified) before using a cached copy.  Idempotent via a marker.
+        """
+        marker = "# skyline-charm: static-asset cache-control"
+        if marker in content:
+            return content
+        anchor = "location / {"
+        block = (
+            f"        {marker}\n"
+            "        location ~* \\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot)$ {\n"
+            "            expires 7d;\n"
+            '            add_header Cache-Control "public, must-revalidate";\n'
+            "            try_files $uri =404;\n"
+            "        }\n\n"
+        )
+        if anchor not in content:
+            logger.warning(
+                "nginx static-asset cache-control not injected: "
+                "no %r anchor found", anchor,
+            )
+            return content
+        content = content.replace(anchor, block + anchor, 1)
+        logger.info("Injected static-asset cache-control into nginx config")
+        return content
+
     def _configure(self):
         error = self._missing_required_config()
         if error:
             self.unit.status = ops.BlockedStatus(error)
             return False
         self._patch_container_infra_bundle()
+        self._inject_error_logger()
         self._publish_shared_db_request()
 
         if self._shared_db_related() and not self._shared_db_data():

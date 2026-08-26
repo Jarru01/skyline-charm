@@ -145,11 +145,12 @@ http {
         }
 
         # ── Static asset caching ────────────────────────────────────────
-        # Webpack output files include a content hash, so they are
-        # safe to cache for a long time.
+        # The charm patches some bundle JS files in-place (same filename),
+        # so we use must-revalidate to ensure browsers always check the
+        # server before using a cached copy.
         location ~* \.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot)$ {
-            expires 30d;
-            add_header Cache-Control "public, immutable";
+            expires 7d;
+            add_header Cache-Control "public, must-revalidate";
             try_files $uri =404;
         }
     }
