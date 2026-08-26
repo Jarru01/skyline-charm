@@ -114,10 +114,12 @@ class SkylineCharm(ops.CharmBase):
         self.framework.observe(self.on.restart_services_action, self._on_action_restart_services)
         self.framework.observe(self.on.show_config_action,      self._on_action_show_config)
         self.framework.observe(self.on.regenerate_nginx_action, self._on_action_regenerate_nginx)
+        self.framework.observe(self.on.patch_frontend_action, self._on_action_patch_frontend)
 
     # ── Low-level helpers ───────────────────────────────────────────────────
 
-    def _run(self, cmd, input_data=None, env=None, cwd=None, capture=False, check=True):
+    def _run(self, cmd, input_data=None, env=None, cwd=None, capture=False,
+             check=True, timeout=None):
         logger.debug("run: %s", " ".join(str(x) for x in cmd))
         kwargs = dict(check=check, cwd=cwd, env=env)
         if input_data is not None:
@@ -125,6 +127,8 @@ class SkylineCharm(ops.CharmBase):
         if capture:
             kwargs["capture_output"] = True
             kwargs["text"] = True
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         return subprocess.run(cmd, **kwargs)
 
     def _apt_install(self, packages: list):
@@ -482,6 +486,56 @@ class SkylineCharm(ops.CharmBase):
         )
         self._stored.static_path = result.stdout.strip()
         logger.info("Console static path: %s", self._stored.static_path)
+        self._patch_container_infra_bundle()
+
+    def _patch_container_infra_bundle(self):
+        """Patch container-infra bundle JS to fix checkVolumeQuota TypeError.
+
+        Upstream skyline-console bug: checkVolumeQuota() destructures
+        ``cinderQuota`` without a fallback. When the OpenStack deployment has
+        no cinder (enableCinder=False), cinderQuota is never fetched, so the
+        destructuring ``{left:l=0}=r`` throws because ``r`` is undefined.
+        The error is caught by the layout's renderChildren try/catch and
+        shows "Error, Unable to get Data, please go to Home page" on the
+        Create Cluster page.
+
+        Fix: ``{left:l=0}=r`` -> ``{left:l=0}=r||{}``
+
+        Idempotent — the patch marker is embedded so subsequent runs are
+        no-ops.
+        """
+        static = self._stored.static_path
+        if not static:
+            return
+        marker = "VOL_QUOTA_PATCHED_V1"
+        bad = "{left:l=0}=r;"
+        good = "{left:l=0}=r||{};"
+        patched = 0
+        static_dir = Path(static)
+        for bundle_file in static_dir.glob("container-infra.bundle.*.js"):
+            try:
+                text = bundle_file.read_text(encoding="utf-8")
+            except Exception:
+                logger.warning("Could not read %s", bundle_file)
+                continue
+            if marker in text:
+                logger.debug("container-infra bundle already patched: %s", bundle_file.name)
+                continue
+            if bad not in text:
+                logger.info("Patch target not found in %s (may already be fixed upstream)", bundle_file.name)
+                continue
+            text = text.replace(bad, good, 1)
+            text = text.replace(
+                "// PATCHED: " + marker,
+                "",
+            )
+            # Append marker comment so we skip this file next time
+            text += f"\n// PATCHED: {marker}\n"
+            bundle_file.write_text(text, encoding="utf-8")
+            patched += 1
+            logger.info("Patched container-infra bundle: %s", bundle_file.name)
+        if patched:
+            logger.info("Patched %d container-infra bundle(s) — nginx reload recommended", patched)
 
     # ── Database ─────────────────────────────────────────────────────────────
 
@@ -732,6 +786,7 @@ class SkylineCharm(ops.CharmBase):
                     "--log-dir", str(SKYLINE_LOG_DIR),
                 ],
                 env=self._venv_env(),
+                timeout=120,
             )
             content = GENERATED_NGINX_PATH.read_text(encoding="utf-8")
             content = content.replace(
@@ -744,6 +799,17 @@ class SkylineCharm(ops.CharmBase):
                 "nginx.conf generated from keystone catalog -> %s", NGINX_CONF_PATH
             )
             return True
+        except subprocess.TimeoutExpired as exc:
+            logger.warning(
+                "skyline-nginx-generator timed out after %ss; "
+                "falling back to static templates/nginx.conf.j2 — "
+                "OpenStack service pages will 404 until regenerated",
+                exc.timeout,
+            )
+            self._render_template(
+                "nginx.conf.j2", NGINX_CONF_PATH, self._template_context()
+            )
+            return False
         except Exception as exc:
             logger.warning(
                 "skyline-nginx-generator failed (%s); "
@@ -798,6 +864,7 @@ class SkylineCharm(ops.CharmBase):
         if error:
             self.unit.status = ops.BlockedStatus(error)
             return False
+        self._patch_container_infra_bundle()
         self._publish_shared_db_request()
 
         if self._shared_db_related() and not self._shared_db_data():
@@ -1065,12 +1132,50 @@ class SkylineCharm(ops.CharmBase):
             generated = self._generate_nginx_config()
             self._run(["nginx", "-t"])
             self._run(["systemctl", "reload-or-restart", "nginx"])
+            self.unit.status = ops.ActiveStatus(
+                f"Skyline ready on :{self.config['listen-port']}"
+            )
             event.set_results({
                 "source": "keystone-catalog" if generated else "static-fallback",
                 "config": str(NGINX_CONF_PATH),
             })
         except Exception as exc:
             event.fail(f"regenerate-nginx failed: {exc}")
+
+    def _on_action_patch_frontend(self, event: ops.ActionEvent):
+        """Manually patch the container-infra JS bundle for cinder-less deploys."""
+        try:
+            if not self._stored.installed:
+                event.fail("Charm is not installed yet")
+                return
+            static = self._stored.static_path
+            if not static:
+                event.fail("static_path not discovered yet")
+                return
+            marker = "VOL_QUOTA_PATCHED_V1"
+            bad = "{left:l=0}=r;"
+            good = "{left:l=0}=r||{};"
+            patched = 0
+            skipped = 0
+            for bundle_file in Path(static).glob("container-infra.bundle.*.js"):
+                text = bundle_file.read_text(encoding="utf-8")
+                if marker in text:
+                    skipped += 1
+                    continue
+                if bad not in text:
+                    skipped += 1
+                    continue
+                text = text.replace(bad, good, 1)
+                text += f"\n// PATCHED: {marker}\n"
+                bundle_file.write_text(text, encoding="utf-8")
+                patched += 1
+            event.set_results({
+                "patched": patched,
+                "skipped": skipped,
+                "static-path": static,
+            })
+        except Exception as exc:
+            event.fail(f"patch-frontend failed: {exc}")
 
 
 if __name__ == "__main__":

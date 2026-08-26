@@ -54,7 +54,7 @@ design.
   discovers/removes backends automatically — no static server lists anywhere
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
-  `get-static-path`
+  `get-static-path`, `patch-frontend`
 
 **Remaining / planned**
 
@@ -367,10 +367,37 @@ juju run skyline get-static-path --wait
 juju run skyline restart-services --wait
 juju run skyline show-config --wait
 juju run skyline regenerate-nginx --wait   # after keystone catalog changes
+juju run skyline patch-frontend --wait    # fix Create Cluster page on cinder-less deploys
 ```
 
 (`skyline` targets the whole app — works whatever the unit id is. `juju run
 skyline/0 ...` also works if the unit really is number 0.)
+
+### Frontend patches (applied automatically)
+
+The charm automatically patches two upstream Skyline Console issues at
+config time (idempotent — safe to run repeatedly):
+
+1. **`patch-frontend` / `checkVolumeQuota` TypeError (Create Cluster page):**
+   Upstream `container-infra` bundle destructures `cinderQuota` without a
+   fallback. When the deployment has **no Cinder** (`enableCinder=false`),
+   `cinderQuota` is never fetched, so the destructuring throws
+   `TypeError: Cannot destructure property 'left' of undefined`. The error
+   is caught by the layout's `renderChildren` try/catch and shows
+   "Error, Unable to get Data, please go to Home page". The fix replaces
+   `{left:l=0}=r;` with `{left:l=0}=r||{};` in the minified bundle.
+
+   **Why Create Cluster Templates are unaffected:** The Template create page
+   (`/container-infra/clusterTemplate/create`) only calls `getDetail()` in
+   its `init()` — it never calls `getQuota()`, so the buggy
+   `checkVolumeQuota()` code path is never reached.
+
+2. **nginx generator timeout:** The keystone catalog query in the nginx
+   generator now has a 120-second timeout. If the generator hangs (e.g.
+   keystone unreachable), the charm falls back to the static
+   `templates/nginx.conf.j2` instead of blocking the Juju hook forever.
+   Previously, a hung generator would leave units stuck in
+   `MaintenanceStatus("Generating nginx config from keystone catalog")`.
 
 ---
 
@@ -711,6 +738,24 @@ openstack role add --project admin --user skyline admin
 Prefix the path with `./` (a bare filename is treated as a charmstore URL):
 ```bash
 juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
+```
+
+**Units stuck in MaintenanceStatus "Generating nginx config from keystone catalog".**
+The nginx generator subprocess hung (e.g. keystone unreachable) and the Juju
+hook blocked. Charm ≥ rev 57 has a 120-second timeout on the generator — it
+falls back to the static template instead of blocking. To recover on older
+revs, refresh the charm and the `upgrade-charm` hook re-runs `_configure()`:
+```bash
+juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
+```
+
+**Create Cluster page shows "Error, Unable to get Data, please go to Home page".**
+The upstream `container-infra` bundle has a `checkVolumeQuota()` bug that
+crashes when Cinder is not in the service catalog. The charm auto-patches this
+at config time. If you see it on a pre-patch deployment:
+```bash
+juju run skyline patch-frontend --wait
+# then hard-refresh the browser (Ctrl+Shift+R)
 ```
 
 ---

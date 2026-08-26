@@ -22,3 +22,9 @@ regenerate-nginx:
     Regenerate /etc/nginx/nginx.conf from the keystone catalog using the
     shipped skyline-nginx-generator, then test and reload nginx. Use after
     the keystone service catalog changes (new regions/services/endpoints).
+
+patch-frontend:
+  description: |
+    Patch the container-infra JS bundle to fix a checkVolumeQuota TypeError
+    that crashes the Create Cluster page when cinder is not in the service
+    catalog. Idempotent — safe to run multiple times.
