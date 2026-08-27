@@ -381,7 +381,7 @@ skyline/0 ...` also works if the unit really is number 0.)
 
 ### Frontend patches (applied automatically)
 
-The charm automatically patches two upstream Skyline Console issues at
+The charm automatically patches upstream Skyline Console issues at
 config time (idempotent — safe to run repeatedly):
 
 1. **`patch-frontend` / `checkVolumeQuota` TypeError (Create Cluster page):**
@@ -394,6 +394,14 @@ config time (idempotent — safe to run repeatedly):
    ALL occurrences of `{left:l=0}=r;` with `{left:l=0}=r||{};` in the
    minified bundle (not just the first match — there are multiple instances
    of this pattern).
+
+2. **`checkVolumeQuota` blocks cluster creation when Cinder is absent:**
+   Even after the TypeError fix, the quota check sees `left: 0` and blocks
+   cluster creation when Cinder is not deployed. The Nova "Create Instance"
+   flow has an `if (!this.enableCinder) return ""` guard but the Magnum
+   flow is missing it. The charm injects the same guard into the minified
+   `checkVolumeQuota()` so the volume check is skipped when Cinder is not
+   in the service catalog.
 
    **Why Create Cluster Templates are unaffected:** The Template create page
    (`/container-infra/clusterTemplate/create`) only calls `getDetail()` in
@@ -768,7 +776,8 @@ juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
 **Create Cluster page shows "Error, Unable to get Data, please go to Home page".**
 The upstream `container-infra` bundle has a `checkVolumeQuota()` bug that
 crashes when Cinder is not in the service catalog. The charm auto-patches this
-at config time. If you see it on a pre-patch deployment:
+at config time (V3 patch — fixes both the TypeError and the missing
+`enableCinder` guard). If you see it on a pre-patch deployment:
 ```bash
 juju run skyline patch-frontend --wait
 # then hard-refresh the browser (Ctrl+Shift+R)

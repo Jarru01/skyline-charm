@@ -489,23 +489,17 @@ class SkylineCharm(ops.CharmBase):
         self._patch_container_infra_bundle()
 
     def _patch_container_infra_bundle(self):
-        """Patch container-infra bundle JS to fix checkVolumeQuota TypeError.
+        """Patch container-infra bundle JS to fix two upstream Skyline bugs.
 
-        Upstream skyline-console bug: checkVolumeQuota() destructures
-        ``cinderQuota`` without a fallback. When the OpenStack deployment has
-        no cinder (enableCinder=False), cinderQuota is never fetched, so the
-        destructuring ``{left:l=0}=r`` throws because ``r`` is undefined.
-        The error is caught by the layout's renderChildren try/catch and
-        shows "Error, Unable to get Data, please go to Home page" on the
-        Create Cluster page.
+        1. **checkVolumeQuota TypeError (V1/V2 fix):** ``{left:l=0}=r;``
+           crashes when ``cinderQuota`` is undefined (no Cinder deployed).
+           Fix: ``{left:l=0}=r||{};`` (all occurrences).
 
-        Fix: ``{left:l=0}=r;`` -> ``{left:l=0}=r||{};`` (all occurrences)
-
-        Replaces ALL occurrences because the same minified pattern appears in
-        both checkInstanceQuota (harmless) and checkVolumeQuota (the actual
-        bug). The V2 marker forces re-patch on files that were incorrectly
-        patched by V1 (which only patched the first occurrence, hitting the
-        wrong one).
+        2. **checkVolumeQuota blocks without Cinder (V3 fix):** Even after
+           the TypeError fix, the quota check sees ``left: 0`` and blocks
+           cluster creation when Cinder is absent. Nova's Create Instance
+           flow has an ``if (!this.enableCinder) return ""`` guard but the
+           Magnum flow is missing it. Fix: inject the same guard.
 
         Also removes stale .gz companion files so nginx serves the patched
         .js files instead of the pre-compressed unpatched originals.
@@ -516,9 +510,16 @@ class SkylineCharm(ops.CharmBase):
         static = self._stored.static_path
         if not static:
             return
-        marker = "VOL_QUOTA_PATCHED_V2"
+        marker = "VOL_QUOTA_PATCHED_V3"
+
+        # Patch 1: prevent TypeError on undefined cinderQuota destructuring
         bad = "{left:l=0}=r;"
         good = "{left:l=0}=r||{};"
+
+        # Patch 2: skip volume quota check when Cinder is not deployed
+        bad_guard = 'if(e)return"";var{newNodes:a}=this.getNodesInput(),{volumes:r}'
+        good_guard = 'if(e)return"";if(!this.enableCinder)return"";var{newNodes:a}=this.getNodesInput(),{volumes:r}'
+
         patched = 0
         static_dir = Path(static)
         for bundle_file in static_dir.glob("container-infra.bundle.*.js"):
@@ -528,21 +529,27 @@ class SkylineCharm(ops.CharmBase):
                 logger.warning("Could not read %s", bundle_file)
                 continue
             if marker in text:
-                logger.debug("container-infra bundle already patched (V2): %s", bundle_file.name)
+                logger.debug("container-infra bundle already patched (V3): %s", bundle_file.name)
                 continue
-            if bad not in text:
-                logger.info("Patch target not found in %s (may already be fixed upstream)", bundle_file.name)
-                continue
-            # Strip any stale V1 marker before re-patching
+            # Strip any stale V1/V2 marker before re-patching
             text = text.replace("// PATCHED: VOL_QUOTA_PATCHED_V1\n", "")
-            count = text.count(bad)
-            text = text.replace(bad, good)
-            # Remove any old marker, append fresh V2 marker
-            text = text.replace(f"\n// PATCHED: {marker}\n", "")
+            text = text.replace("// PATCHED: VOL_QUOTA_PATCHED_V2\n", "")
+
+            # Apply patch 1
+            if bad in text:
+                count = text.count(bad)
+                text = text.replace(bad, good)
+                logger.info("Applied checkVolumeQuota TypeError fix (%d occurrences): %s", count, bundle_file.name)
+
+            # Apply patch 2
+            if bad_guard in text:
+                text = text.replace(bad_guard, good_guard)
+                logger.info("Applied enableCinder guard to checkVolumeQuota: %s", bundle_file.name)
+
             text += f"\n// PATCHED: {marker}\n"
             bundle_file.write_text(text, encoding="utf-8")
             patched += 1
-            logger.info("Patched container-infra bundle (%d occurrences): %s", count, bundle_file.name)
+
             # Remove stale .gz companion — nginx would serve the pre-compressed
             # unpatched version via gzip_static instead of the patched .js
             gz = bundle_file.with_suffix(bundle_file.suffix + ".gz")
