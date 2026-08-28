@@ -76,6 +76,224 @@ LOCAL_MARIADB_PORT = 13306
 MARIADB_CNF_PATH   = Path("/etc/mysql/mariadb.conf.d/60-skyline.cnf")
 
 
+# ── Kubeconfig endpoint source ─────────────────────────────────────────────
+# Injected into skyline_apiserver/api/v1/kubeconfig.py by _patch_kubeconfig_endpoint().
+# Mimics `openstack coe cluster config`: reads the logged-in user's keystone
+# token (from the session cookie / X-Auth-Token header), discovers Magnum via
+# the keystone catalog, fetches the cluster CA, signs a freshly generated
+# client certificate (CN=admin, O=system:masters = full cluster-admin) via
+# Magnum's /v1/certificates endpoint, and assembles a complete kubeconfig YAML.
+
+_KUBECONFIG_ENDPOINT_SRC = '''\
+"""Kubeconfig generation endpoint — injected by the skyline-charm."""
+# skyline-charm: kubeconfig endpoint v4
+import base64
+import logging
+
+import jose.jwt as _jwt
+import requests as _requests
+import yaml as _yaml
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import APIRouter, Request
+from fastapi.responses import PlainTextResponse
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_SKYLINE_YAML = "/etc/skyline/skyline.yaml"
+
+
+def _get_keystone_url():
+    # keystone_url lives under the 'openstack:' section; tolerate a
+    # legacy 'default:' placement too. Raises if missing/unreadable so the
+    # caller surfaces a clear 502 instead of silently guessing a URL.
+    with open(_SKYLINE_YAML, "r") as f:
+        cfg = _yaml.safe_load(f)
+    for section in ("openstack", "default"):
+        url = (cfg.get(section, {}) or {}).get("keystone_url")
+        if url:
+            return url.rstrip("/")
+    raise RuntimeError("keystone_url not found in skyline.yaml")
+
+
+def _get_secret_key():
+    try:
+        with open(_SKYLINE_YAML, "r") as f:
+            cfg = _yaml.safe_load(f)
+        return (cfg.get("default", {}) or {}).get("secret_key", "")
+    except Exception:
+        return ""
+
+
+def _get_token(request: Request):
+    """Return the raw keystone token from the request.
+
+    1. Prefer the X-Auth-Token header (sent by the console's axios
+       interceptor for OpenStack API calls; forwarded by nginx).
+    2. Fall back to decoding the ``session`` JWT cookie.
+    """
+    token = request.headers.get("X-Auth-Token")
+    if token:
+        return token.strip()
+
+    cookie = request.cookies.get("session")
+    if not cookie:
+        return ""
+    try:
+        payload = _jwt.decode(cookie, _get_secret_key(), algorithms=["HS256"])
+        return (payload or {}).get("keystone_token", "")
+    except Exception as exc:
+        logger.warning("Failed to decode session JWT: %s", exc)
+        return ""
+
+
+def _get_magnum_url(keystone_url, token):
+    """Return the public container-infra endpoint (without trailing /v1)."""
+    resp = _requests.get(
+        f"{keystone_url}/auth/catalog",
+        headers={"X-Auth-Token": token},
+        verify=False,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    for svc in resp.json().get("catalog", []):
+        if svc.get("type") == "container-infra":
+            for ep in svc.get("endpoints", []):
+                if ep.get("interface") == "public":
+                    url = ep.get("url", "")
+                    return url.rstrip("/").rsplit("/v1", 1)[0]
+    raise RuntimeError("container-infra endpoint not found in catalog")
+
+
+@router.get(
+    "/clusters/{cluster_id}/kubeconfig",
+    response_class=PlainTextResponse,
+    status_code=200,
+)
+def get_cluster_kubeconfig(cluster_id: str, request: Request):
+    """Build and return a kubeconfig for *cluster_id*.
+
+    A plain ``def`` (not ``async def``) so FastAPI dispatches it to a worker
+    thread: the upstream keystone/Magnum calls below are blocking ``requests``
+    calls that would otherwise stall the asyncio event loop for seconds.
+    """
+    # 1. Extract the user's raw keystone token
+    token = _get_token(request)
+    if not token:
+        return PlainTextResponse("Not authenticated", status_code=401)
+
+    headers = {"X-Auth-Token": token}
+
+    # 2. Discover Magnum endpoint from the keystone catalog
+    try:
+        magnum_base = _get_magnum_url(_get_keystone_url(), token)
+    except Exception as exc:
+        logger.exception("Failed to discover Magnum endpoint")
+        return PlainTextResponse(f"Magnum discovery failed: {exc}", status_code=502)
+
+    # 3. Fetch cluster detail
+    cluster_resp = _requests.get(
+        f"{magnum_base}/v1/clusters/{cluster_id}",
+        headers=headers,
+        verify=False,
+        timeout=30,
+    )
+    if cluster_resp.status_code != 200:
+        return PlainTextResponse(
+            f"Failed to fetch cluster: {cluster_resp.text}",
+            status_code=cluster_resp.status_code,
+        )
+    cluster = cluster_resp.json()
+
+    # 4. Fetch CA certificate
+    cert_resp = _requests.get(
+        f"{magnum_base}/v1/certificates/{cluster_id}",
+        headers=headers,
+        verify=False,
+        timeout=30,
+    )
+    if cert_resp.status_code != 200:
+        return PlainTextResponse(
+            f"Failed to fetch CA certificate: {cert_resp.text}",
+            status_code=cert_resp.status_code,
+        )
+    ca_pem = cert_resp.json().get("pem", "")
+
+    # 5. Generate client key pair and CSR.
+    #    CN=admin, O=system:masters matches what `openstack coe cluster
+    #    config` signs — a full cluster-admin certificate. Magnum preserves
+    #    the organization from the CSR in the signed cert.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([
+        x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "admin"),
+        x509.NameAttribute(x509.oid.NameOID.ORGANIZATION_NAME, "system:masters"),
+    ])
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(subject)
+        .sign(key, hashes.SHA256())
+    )
+    csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+    # 6. Sign the client certificate via Magnum
+    sign_resp = _requests.post(
+        f"{magnum_base}/v1/certificates",
+        headers={**headers, "Content-Type": "application/json"},
+        json={"cluster_uuid": cluster_id, "csr": csr_pem},
+        verify=False,
+        timeout=30,
+    )
+    if sign_resp.status_code not in (200, 201):
+        return PlainTextResponse(
+            f"Failed to sign client certificate: {sign_resp.text}",
+            status_code=sign_resp.status_code,
+        )
+    client_cert_pem = sign_resp.json().get("pem", "")
+
+    # 7. Export private key as PEM
+    private_key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+
+    # 8. Assemble kubeconfig
+    api_address = cluster.get("api_address", "")
+    cluster_name = cluster.get("name", cluster_id)
+
+    ca_b64 = base64.b64encode(ca_pem.encode()).decode()
+    cert_b64 = base64.b64encode(client_cert_pem.encode()).decode()
+    key_b64 = base64.b64encode(private_key_pem.encode()).decode()
+
+    kubeconfig = (
+        "apiVersion: v1\\n"
+        "clusters:\\n"
+        "- cluster:\\n"
+        f"    certificate-authority-data: {ca_b64}\\n"
+        f"    server: {api_address}\\n"
+        f"  name: {cluster_name}\\n"
+        "contexts:\\n"
+        "- context:\\n"
+        f"    cluster: {cluster_name}\\n"
+        "    user: admin\\n"
+        "  name: default\\n"
+        "current-context: default\\n"
+        "kind: Config\\n"
+        "preferences: {}\\n"
+        "users:\\n"
+        "- name: admin\\n"
+        "  user:\\n"
+        f"    client-certificate-data: {cert_b64}\\n"
+        f"    client-key-data: {key_b64}\\n"
+    )
+
+    return PlainTextResponse(kubeconfig, media_type="text/yaml")
+'''
+
+
 class SkylineCharm(ops.CharmBase):
     """Juju charm deploying the OpenStack Skyline Dashboard."""
 
@@ -115,6 +333,7 @@ class SkylineCharm(ops.CharmBase):
         self.framework.observe(self.on.show_config_action,      self._on_action_show_config)
         self.framework.observe(self.on.regenerate_nginx_action, self._on_action_regenerate_nginx)
         self.framework.observe(self.on.patch_frontend_action, self._on_action_patch_frontend)
+        self.framework.observe(self.on.patch_kubeconfig_action, self._on_action_patch_kubeconfig)
 
     # ── Low-level helpers ───────────────────────────────────────────────────
 
@@ -488,6 +707,25 @@ class SkylineCharm(ops.CharmBase):
         logger.info("Console static path: %s", self._stored.static_path)
         self._patch_container_infra_bundle()
 
+    def _remove_stale_gz_files(self, static_dir: Path) -> int:
+        """Remove ALL .gz files in the static directory.
+
+        ``gzip_static on`` in the keystone-generated nginx.conf makes nginx
+        serve ``*.gz`` companions INSTEAD of the corresponding ``*.js``
+        files, completely bypassing all charm patches.  Removing every ``.gz``
+        file in the directory is the safest approach.
+        """
+        removed = 0
+        for gz in static_dir.glob("*.gz"):
+            try:
+                gz.unlink()
+                removed += 1
+            except Exception as exc:
+                logger.warning("Could not remove %s: %s", gz, exc)
+        if removed:
+            logger.info("Removed %d stale .gz files from %s", removed, static_dir)
+        return removed
+
     def _patch_container_infra_bundle(self):
         """Patch container-infra bundle JS to fix two upstream Skyline bugs.
 
@@ -549,18 +787,252 @@ class SkylineCharm(ops.CharmBase):
             text += f"\n// PATCHED: {marker}\n"
             bundle_file.write_text(text, encoding="utf-8")
             patched += 1
-
-            # Remove stale .gz companion — nginx would serve the pre-compressed
-            # unpatched version via gzip_static instead of the patched .js
-            gz = bundle_file.with_suffix(bundle_file.suffix + ".gz")
-            if gz.exists():
-                try:
-                    gz.unlink()
-                    logger.info("Removed stale gzip companion: %s", gz.name)
-                except Exception as exc:
-                    logger.warning("Could not remove %s: %s", gz, exc)
+        self._remove_stale_gz_files(static_dir)
         if patched:
             logger.info("Patched %d container-infra bundle(s) — nginx reload recommended", patched)
+
+    # ── Kubeconfig download button ──────────────────────────────────────────
+
+    def _patch_magnum_kubeconfig(self):
+        """Patch main + container-infra bundles to add a Download Kubeconfig button.
+
+        Adds a ``config`` extendOperation to the MagnumClient (main.bundle) so
+        the browser can ask the apiserver for the kubeconfig, and wires a
+        DownloadKubeconfig action into the cluster detail page
+        (container-infra.bundle) that saves the response as a .yaml file.
+
+        The kubeconfig is built server-side by the injected
+        /api/v1/clusters/{id}/kubeconfig endpoint (mimics ``openstack coe
+        cluster config``) — see _patch_kubeconfig_endpoint().
+
+        The action is added as a new webpack module (9999) appended to the
+        container-infra bundle, then imported by module 1696 (the
+        actionConfigs module).  This avoids variable-scope collisions that
+        would occur from injecting code inside an existing module body.
+
+        Idempotent by pattern matching — each sub-patch checks for its own
+        old pattern before replacing.  No marker-based skipping (a broken
+        patch from a previous deploy could set the marker while leaving the
+        file in a bad state, preventing the correct patch from running).
+        Old KUBECONFIG_PATCHED_V1 markers are stripped to force re-patching.
+        """
+        static = self._stored.static_path
+        if not static:
+            return
+        static_dir = Path(static)
+        patched = 0
+
+        # ── Patch 1: main.bundle — add config extendOperation to MagnumClient ──
+        old_magnum_ops = (
+            'extendOperations:[{name:"resize",key:"actions/resize",method:"post"},'
+            '{name:"upgrade",key:"actions/upgrade",method:"post"}]'
+        )
+        new_magnum_ops = (
+            'extendOperations:[{name:"resize",key:"actions/resize",method:"post"},'
+            '{name:"upgrade",key:"actions/upgrade",method:"post"},'
+            '{name:"config",key:"config",method:"get",'
+            'generate:function(e){'
+            'var s=localStorage.getItem("keystone_token");'
+            'try{s=JSON.parse(s);s=s.value}catch(x){}'
+            'var h={credentials:"include"};'
+            'if(s){h.headers={"X-Auth-Token":s}}'
+            'return fetch("/api/openstack/skyline/api/v1/clusters/"+e+"/kubeconfig",h)'
+            '.then(function(e){return e.blob()})}}'
+            "]"
+        )
+        for bundle_file in static_dir.glob("main.bundle.*.js"):
+            try:
+                text = bundle_file.read_text(encoding="utf-8")
+            except Exception:
+                logger.warning("Could not read %s", bundle_file)
+                continue
+            # Strip stale marker from any previous deploy to force re-patching
+            orig = text
+            text = text.replace("\n// PATCHED: KUBECONFIG_PATCHED_V1\n", "")
+            markers_stripped = text != orig
+            if old_magnum_ops not in text and not markers_stripped:
+                logger.debug("main bundle already patched (kubeconfig): %s", bundle_file.name)
+                continue
+            if old_magnum_ops in text:
+                text = text.replace(old_magnum_ops, new_magnum_ops, 1)
+            bundle_file.write_text(text, encoding="utf-8")
+            patched += 1
+            logger.info("Patched MagnumClient config extendOperation: %s", bundle_file.name)
+
+        # ── Patch 2: container-infra.bundle — new module 9999 + wire into module 1696 ──
+
+        # 2a: New webpack module appended to the bundle.
+        # Follows the exact pattern of module 4307 (DeleteClusterAction).
+        new_module = (
+            "9999:function(e,a,r){"
+            '"use strict";'
+            "var l=r(20),n=r(21);"
+            'l(a,"__esModule",{value:!0}),a.default=void 0;'
+            "var i=n(r(35)),o=r(1244),s=n(r(1344));"
+            "class u extends o.ConfirmAction{"
+            "constructor(){super(...arguments),"
+            '(0,i.default)(this,"policy","cluster:detail"),'
+            "(0,i.default)(this,\"allowedCheckFunc\","
+            '(function(e){return"CREATE_COMPLETE"===e.status})),'
+            "(0,i.default)(this,\"onSubmit\","
+            "(function(e){return s.default.config(e).then((function(t){"
+            "var a=(t instanceof Blob)?t:new Blob([t.data||t],{type:\"text/yaml;charset=utf-8\"});"
+            "var l=document.createElement(\"a\");"
+            "l.href=URL.createObjectURL(a);"
+            'l.download=(e.name||e.id)+"-kubeconfig.yaml";'
+            "l.click();"
+            "URL.revokeObjectURL(l.href)}))}))}"
+            'get id(){return"download-kubeconfig"}'
+            'get title(){return"Download Kubeconfig"}'
+            'get actionName(){return"Download Kubeconfig"}'
+            'get buttonText(){return"Download kubeconfig"}'
+            'get isDanger(){return!1}'
+            "}"
+            "a.default=u"
+            "},"
+        )
+
+        # 2b: Modify module 1696 — add import of module 9999 and wire into moreActions
+        old_1696_imports = "var n=l(a(4307)),i=l(a(4308)),o=l(a(1488)),s={"
+        new_1696_imports = "var n=l(a(4307)),i=l(a(4308)),o=l(a(1488)),d=l(a(9999)),s={"
+
+        old_more_actions = "moreActions:[{action:i.default}]"
+        new_more_actions = "moreActions:[{action:d.default},{action:i.default}]"
+
+        # 2c: Add config() method to ClustersStore
+        old_store = (
+            'upgrade(e,t){var a=this;return(0,g.default)((function*()'
+            "{var{id:r}=e;return a.client.upgrade(r,t)}))()}"
+        )
+        new_store = (
+            'upgrade(e,t){var a=this;return(0,g.default)((function*()'
+            "{var{id:r}=e;return a.client.upgrade(r,t)}))()}"
+            'config(e){var a=this;return(0,g.default)((function*()'
+            "{var{id:r}=e;return a.client.config(r)}))()}"
+        )
+
+        for bundle_file in static_dir.glob("container-infra.bundle.*.js"):
+            try:
+                text = bundle_file.read_text(encoding="utf-8")
+            except Exception:
+                logger.warning("Could not read %s", bundle_file)
+                continue
+            # Strip stale marker from any previous deploy to force re-patching
+            orig = text
+            text = text.replace("\n// PATCHED: KUBECONFIG_PATCHED_V1\n", "")
+            markers_stripped = text != orig
+            changed = markers_stripped
+
+            # 2c: store method (must come before module injection since it's
+            # a simple string replacement on existing code)
+            if old_store in text:
+                text = text.replace(old_store, new_store, 1)
+                changed = True
+                logger.info("Added config() method to ClustersStore: %s", bundle_file.name)
+
+            # 2a: append new module 9999 before the closing of the bundle
+            # Find the end of module 1696 to insert before 1697
+            anchor = "1697:function(e,t,a)"
+            if anchor in text and "9999:function" not in text:
+                text = text.replace(anchor, new_module + anchor, 1)
+                changed = True
+                logger.info("Injected DownloadKubeconfig module 9999: %s", bundle_file.name)
+
+            # 2b: wire into module 1696 imports and moreActions
+            if old_1696_imports in text:
+                text = text.replace(old_1696_imports, new_1696_imports, 1)
+                changed = True
+            if old_more_actions in text:
+                text = text.replace(old_more_actions, new_more_actions, 1)
+                changed = True
+                logger.info("Wired DownloadKubeconfig into actionConfigs: %s", bundle_file.name)
+
+            if changed:
+                bundle_file.write_text(text, encoding="utf-8")
+                patched += 1
+
+        # Remove ALL stale .gz companions — nginx gzip_static would serve the
+        # unpatched pre-compressed versions instead of the patched .js files.
+        self._remove_stale_gz_files(static_dir)
+
+        if patched:
+            logger.info("Patched %d bundle(s) for kubeconfig download — nginx reload recommended", patched)
+
+    # ── Kubeconfig backend endpoint ───────────────────────────────────────
+
+    def _patch_kubeconfig_endpoint(self, venv_lib: Path = Path("/opt/skyline-venv/lib")):
+        """Inject a FastAPI endpoint into skyline_apiserver for kubeconfig generation.
+
+        The endpoint lives at /api/v1/clusters/{cluster_id}/kubeconfig and:
+        1. Reads the keystone token from the ``session`` cookie / header.
+        2. Queries the Magnum API for cluster detail and CA certificate.
+        3. Generates a client key pair + CSR, signs it via Magnum's
+           /v1/certificates endpoint.
+        4. Assembles and returns a Kubernetes kubeconfig YAML.
+
+        This replaces the browser-side /config call which does not exist in
+        this Magnum deployment.
+        """
+        # Locate the installed skyline_apiserver package
+        pkg_dir = None
+        for site_dir in venv_lib.glob("python*/site-packages"):
+            candidate = site_dir / "skyline_apiserver"
+            if candidate.is_dir():
+                pkg_dir = candidate
+                break
+        if not pkg_dir:
+            logger.warning("skyline_apiserver package not found; skipping kubeconfig endpoint")
+            return
+
+        # 1. Write the kubeconfig.py endpoint file
+        kubeconfig_py = pkg_dir / "api" / "v1" / "kubeconfig.py"
+        if kubeconfig_py.exists():
+            existing = kubeconfig_py.read_text(encoding="utf-8")
+            if "# skyline-charm: kubeconfig endpoint v4" in existing:
+                logger.debug("kubeconfig endpoint already up-to-date")
+            else:
+                kubeconfig_py.write_text(_KUBECONFIG_ENDPOINT_SRC, encoding="utf-8")
+                logger.info("Updated kubeconfig endpoint: %s", kubeconfig_py)
+        else:
+            kubeconfig_py.write_text(_KUBECONFIG_ENDPOINT_SRC, encoding="utf-8")
+            logger.info("Wrote kubeconfig endpoint: %s", kubeconfig_py)
+
+        # 2. Patch api/v1/__init__.py to import and register the new router
+        init_file = pkg_dir / "api" / "v1" / "__init__.py"
+        if not init_file.exists():
+            logger.warning("__init__.py not found at %s", init_file)
+            return
+        text = init_file.read_text(encoding="utf-8")
+        marker = "# skyline-charm: kubeconfig endpoint"
+        if marker in text:
+            logger.debug("api/v1/__init__.py already patched for kubeconfig")
+            return
+
+        # Add import
+        old_import = (
+            "from skyline_apiserver.api.v1 import "
+            "contrib, extension, login, policy, prometheus, setting"
+        )
+        new_import = (
+            "from skyline_apiserver.api.v1 import "
+            "contrib, extension, kubeconfig, login, policy, prometheus, setting"
+        )
+        if old_import in text:
+            text = text.replace(old_import, new_import, 1)
+
+        # Add router include
+        old_include = (
+            'api_router.include_router(setting.router, tags=["Setting"])'
+        )
+        new_include = (
+            'api_router.include_router(setting.router, tags=["Setting"])\n'
+            f'api_router.include_router(kubeconfig.router, tags=["Kubeconfig"])  {marker}'
+        )
+        if old_include in text:
+            text = text.replace(old_include, new_include, 1)
+
+        init_file.write_text(text, encoding="utf-8")
+        logger.info("Patched api/v1/__init__.py to include kubeconfig router")
 
     # ── Database ─────────────────────────────────────────────────────────────
 
@@ -926,6 +1398,8 @@ class SkylineCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(error)
             return False
         self._patch_container_infra_bundle()
+        self._patch_magnum_kubeconfig()
+        self._patch_kubeconfig_endpoint()
         self._publish_shared_db_request()
 
         if self._shared_db_related() and not self._shared_db_data():
@@ -1246,6 +1720,27 @@ class SkylineCharm(ops.CharmBase):
             })
         except Exception as exc:
             event.fail(f"patch-frontend failed: {exc}")
+
+    def _on_action_patch_kubeconfig(self, event: ops.ActionEvent):
+        """Inject the kubeconfig backend endpoint and enable the button."""
+        try:
+            if not self._stored.installed:
+                event.fail("Charm is not installed yet")
+                return
+            static = self._stored.static_path
+            if not static:
+                event.fail("static_path not discovered yet")
+                return
+            self._patch_magnum_kubeconfig()
+            self._patch_kubeconfig_endpoint()
+            # New router file must be loaded by the apiserver
+            self._restart_services(nginx=False)
+            self.unit.status = ops.ActiveStatus(
+                f"Skyline ready on :{self.config['listen-port']}"
+            )
+            event.set_results({"result": "kubeconfig button patched"})
+        except Exception as exc:
+            event.fail(f"patch-kubeconfig failed: {exc}")
 
 
 if __name__ == "__main__":

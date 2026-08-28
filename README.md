@@ -54,8 +54,8 @@ design.
   discovers/removes backends automatically — no static server lists anywhere
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
-  `get-static-path`, `patch-frontend`
-- **Unit tests:** 75 tests covering helpers, nginx injection, JS patching,
+  `get-static-path`, `patch-frontend`, `patch-kubeconfig`
+- **Unit tests:** 93 tests covering helpers, nginx injection, JS patching,
   actions, lifecycle events, and relations (run with `py -3 -m pytest tests/`)
 
 **Remaining / planned**
@@ -95,7 +95,7 @@ skyline-charm/
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
 │   │   offline_proof.sh, check_db.sh
 │   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
-├── tests/                             # unit tests (offline, 75 tests)
+├── tests/                             # unit tests (offline, 93 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
 │   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config tests
@@ -374,6 +374,7 @@ juju run skyline restart-services --wait
 juju run skyline show-config --wait
 juju run skyline regenerate-nginx --wait   # after keystone catalog changes
 juju run skyline patch-frontend --wait    # fix Create Cluster page on cinder-less deploys
+juju run skyline patch-kubeconfig --wait # inject kubeconfig endpoint + Download button
 ```
 
 (`skyline` targets the whole app — works whatever the unit id is. `juju run
@@ -422,6 +423,35 @@ config time (idempotent — safe to run repeatedly):
    is critical because the charm patches bundle JS files in-place (same
    filename), so without `must-revalidate`, browsers would serve stale
    cached versions until the expiry elapsed.
+
+4. **Download Kubeconfig button (`patch-kubeconfig`):** Adds a working
+   "Download Kubeconfig" action to every cluster row/detail menu in the
+   Magnum dashboard. Upstream Skyline calls Magnum's
+   `/v1/clusters/{id}/config`, which does **not exist** in this deployment
+   (404). Instead the charm:
+
+   - Patches `main.bundle` to add a `config` extendOperation to the
+     MagnumClient that `fetch()`es the apiserver (credentials included).
+   - Injects a new webpack module (`9999`) into `container-infra.bundle`
+     with the `DownloadKubeconfig` action (a `ConfirmAction`), wires it
+     into module 1696's `moreActions`, and adds a `config()` method to the
+     ClustersStore.
+   - Injects a FastAPI endpoint into `skyline_apiserver` at
+     `/api/v1/clusters/{cluster_id}/kubeconfig` that authenticates via the
+     session cookie/`X-Auth-Token` header, looks up the cluster + CA
+     certificate from the Magnum API, generates a client key/CSR, signs it
+     through Magnum's `/v1/certificates`, and returns a full
+     `<cluster>-kubeconfig.yaml`. This mirrors `openstack coe cluster config`
+     and produces the same cluster-admin kubeconfig the CLI exposes.
+
+   The endpoint is a plain (non-`async`) FastAPI handler so the blocking
+   keystone/Magnum HTTP calls run on worker threads, never blocking the
+   apiserver event loop; the keystone URL is always read from
+   `/etc/skyline/skyline.yaml` (no hardcoded fallback).
+
+   As with the other patches it is idempotent (a stale marker is stripped and
+   the file re-patched). Stale `.gz` companions are deleted after patching so
+   `gzip_static` never serves the pre-compressed unpatched bundles.
 
 ---
 
@@ -878,7 +908,7 @@ each one.
 
 ## Testing
 
-75 local unit tests cover the charm's logic layer — helper functions, nginx
+93 local unit tests cover the charm's logic layer — helper functions, nginx
 injection, JS bundle patching, action handlers, lifecycle events, and relation
 handlers. They run entirely offline (no Juju/MAAS required) and mock all
 subprocess calls.

@@ -28,3 +28,10 @@ patch-frontend:
     Patch the container-infra JS bundle to fix a checkVolumeQuota TypeError
     that crashes the Create Cluster page when cinder is not in the service
     catalog. Idempotent — safe to run multiple times.
+
+patch-kubeconfig:
+  description: |
+    Inject the kubeconfig-download backend endpoint and patch the
+    skyline-console JS bundles so every cluster row has a working
+    "Download Kubeconfig" button. Idempotent — safe to run multiple times.
+    Restarts skyline-apiserver to load the new endpoint.

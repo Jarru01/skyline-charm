@@ -53,3 +53,45 @@ def make_bundle_file(static_dir, filename="container-infra.bundle.1786807402.js"
     path = static_dir / filename
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def make_main_bundle_file(static_dir, filename="main.bundle.1786807402.js",
+                          content=None):
+    """Create a fake main bundle JS file with MagnumClient pattern."""
+    if content is None:
+        content = (
+            'class l extends o.default{get baseUrl(){return(0,i.magnumBase)()}'
+            "get resources(){return["
+            '{name:"clusters",key:"clusters",responseKey:"cluster",'
+            "extendOperations:["
+            '{name:"resize",key:"actions/resize",method:"post"},'
+            '{name:"upgrade",key:"actions/upgrade",method:"post"}'
+            "]}"
+            "]}}"
+        )
+    path = static_dir / filename
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def make_apiserver_venv(tmp_path, init_content=None):
+    """Create a fake skyline_apiserver package tree and return its venv_lib.
+
+    The layout mirrors the production install:
+    <venv>/lib/python3.10/site-packages/skyline_apiserver/api/v1/__init__.py
+    """
+    v1_dir = (
+        tmp_path / "venv" / "lib" / "python3.10" / "site-packages"
+        / "skyline_apiserver" / "api" / "v1"
+    )
+    v1_dir.mkdir(parents=True, exist_ok=True)
+    if init_content is None:
+        init_content = (
+            "from skyline_apiserver.api.v1 import "
+            "contrib, extension, login, policy, prometheus, setting\n"
+            "\n"
+            "api_router = APIRouter()\n"
+            'api_router.include_router(setting.router, tags=["Setting"])\n'
+        )
+    (v1_dir / "__init__.py").write_text(init_content, encoding="utf-8")
+    return tmp_path / "venv" / "lib"
