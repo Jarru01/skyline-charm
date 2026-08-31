@@ -194,6 +194,49 @@ class TestPatchKubeconfig:
         assert main_result.count('name:"config"') == 1
         assert ci_result.count("9999:function") == 1
 
+    def test_broadens_allowed_checkfunc_on_injected_module(self, harness_installed, static_dir):
+        """Fresh injection uses the broadened allowedCheckFunc (all healthy
+        completion states), not CREATE_COMPLETE-only."""
+        make_bundle_file(static_dir, content=_FAKE_CI_BUNDLE)
+        harness_installed.charm._patch_magnum_kubeconfig()
+        result = (static_dir / "container-infra.bundle.1786807402.js").read_text()
+        assert 'return"CREATE_COMPLETE"===e.status' not in result
+        assert "/^(?:CREATE|UPDATE|ROLLBACK|RESUME|RESTORE|SNAPSHOT|ADOPT|CHECK)_COMPLETE$/".replace("_COMPLETE$", "_COMPLETE$") in result
+
+    def test_upgrades_already_patched_old_guard(self, harness_installed, static_dir):
+        """An already-patched bundle (module 9999 present with the OLD
+        CREATE_COMPLETE-only guard) is upgraded in place to the broadened
+        allowedCheckFunc."""
+        # Simulate the deployed (old) patched bundle: module 9999 exists with
+        # the CREATE_COMPLETE-only allowedCheckFunc, plus existing wiring so
+        # the sub-patches (store/imports/moreActions/module-injection) are no-ops.
+        old_guard = 'allowedCheckFunc",(function(e){return"CREATE_COMPLETE"===e.status})'
+        old_patched = (
+            '1696:function(e,t,a){"use strict";var r=a(20),l=a(21);'
+            'r(t,"__esModule",{value:!0}),t.default=void 0;'
+            "var n=l(a(4307)),i=l(a(4308)),o=l(a(1488)),d=l(a(9999)),s={"
+            "actionConfigs:{rowActions:{firstAction:n.default,moreActions:[{action:d.default},{action:i.default}]},"
+            "batchActions:[n.default],primaryActions:[o.default]},"
+            "actionConfigsAdmin:{rowActions:{firstAction:n.default,moreActions:[]},"
+            "batchActions:[n.default],primaryActions:[]}}"
+            ";t.default=s},"
+            '9999:function(e,a,r){"use strict";var i=n(r(35)),o=r(1244),s=n(r(1344));'
+            "class u extends o.ConfirmAction{constructor(){super(...arguments),"
+            + old_guard + ','
+            "(0,i.default)(this,\"onSubmit\",\"fn\")}"
+            'get id(){return"download-kubeconfig"}'
+            'get buttonText(){return"Download kubeconfig"}'
+            "get isDanger(){return!1}}},"
+            '1697:function(e,t,a){nextmodule}'
+        )
+        make_bundle_file(static_dir, content=old_patched)
+        harness_installed.charm._patch_magnum_kubeconfig()
+        result = (static_dir / "container-infra.bundle.1786807402.js").read_text()
+        # Old guard gone, broadened regex present, exactly one module
+        assert 'return"CREATE_COMPLETE"===e.status' not in result
+        assert "/^(?:CREATE|UPDATE|ROLLBACK|RESUME|RESTORE|SNAPSHOT|ADOPT|CHECK)_COMPLETE$/" in result
+        assert result.count("9999:function") == 1
+
     def test_noop_when_static_path_empty(self, harness):
         """No-op when static_path is not yet discovered."""
         harness.begin()

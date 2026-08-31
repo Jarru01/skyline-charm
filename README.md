@@ -435,7 +435,13 @@ config time (idempotent — safe to run repeatedly):
    - Injects a new webpack module (`9999`) into `container-infra.bundle`
      with the `DownloadKubeconfig` action (a `ConfirmAction`), wires it
      into module 1696's `moreActions`, and adds a `config()` method to the
-     ClustersStore.
+     ClustersStore. The action's `allowedCheckFunc` enables it in **every**
+     healthy completed cluster state (CREATE/UPDATE/ROLLBACK/RESUME/RESTORE/
+     SNAPSHOT/ADOPT/CHECK), not just `CREATE_COMPLETE`, so the button stays
+     available after a resize/update (which flips the status to
+     `UPDATE_COMPLETE`); DELETE_COMPLETE and all `*_IN_PROGRESS`/`*_FAILED`
+     states hide it. Already-patched bundles are upgraded in place, so a
+     `juju refresh` re-applies this broadening to existing units.
    - Injects a FastAPI endpoint into `skyline_apiserver` at
      `/api/v1/clusters/{cluster_id}/kubeconfig` that authenticates via the
      session cookie/`X-Auth-Token` header, looks up the cluster + CA

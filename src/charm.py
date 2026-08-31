@@ -810,6 +810,15 @@ class SkylineCharm(ops.CharmBase):
         actionConfigs module).  This avoids variable-scope collisions that
         would occur from injecting code inside an existing module body.
 
+        Visibility: the ``allowedCheckFunc`` accepts every *healthy*
+        completed cluster state from the upstream ``clusterStatus`` enum
+        (CREATE/UPDATE/ROLLBACK/RESUME/RESTORE/SNAPSHOT/ADOPT/CHECK — but not
+        DELETE_COMPLETE, and none of the *_IN_PROGRESS/*_FAILED states).  The
+        action only reads cluster state, so it is safe to show after a
+        resize/update; gating it to CREATE_COMPLETE alone would hide the
+        button once a cluster is updated.  Already-patched bundles are
+        upgraded in place by replacing the old CREATE_COMPLETE-only guard.
+
         Idempotent by pattern matching — each sub-patch checks for its own
         old pattern before replacing.  No marker-based skipping (a broken
         patch from a previous deploy could set the marker while leaving the
@@ -863,6 +872,18 @@ class SkylineCharm(ops.CharmBase):
 
         # 2a: New webpack module appended to the bundle.
         # Follows the exact pattern of module 4307 (DeleteClusterAction).
+        # The Download Kubeconfig action only reads cluster state (fetches a
+        # CA + signs a client cert server-side), so it is safe to offer in any
+        # healthy/completed cluster state — not only CREATE_COMPLETE. Without
+        # this, the button vanishes once a cluster is resized/updated
+        # (status becomes UPDATE_COMPLETE). We therefore allow every completion
+        # state alias(es) in the upstream clusterStatus enum, excluding
+        # DELETE_COMPLETE (cluster is gone) and all *_IN_PROGRESS / *_FAILED.
+        allowed_old = '(function(e){return"CREATE_COMPLETE"===e.status})'
+        allowed_new = (
+            '(function(e){return/^(?:CREATE|UPDATE|ROLLBACK|RESUME|RESTORE|'
+            'SNAPSHOT|ADOPT|CHECK)_COMPLETE$/.test(e.status)})'
+        )
         new_module = (
             "9999:function(e,a,r){"
             '"use strict";'
@@ -873,7 +894,7 @@ class SkylineCharm(ops.CharmBase):
             "constructor(){super(...arguments),"
             '(0,i.default)(this,"policy","cluster:detail"),'
             "(0,i.default)(this,\"allowedCheckFunc\","
-            '(function(e){return"CREATE_COMPLETE"===e.status})),'
+            + allowed_new + "),"
             "(0,i.default)(this,\"onSubmit\","
             "(function(e){return s.default.config(e).then((function(t){"
             "var a=(t instanceof Blob)?t:new Blob([t.data||t],{type:\"text/yaml;charset=utf-8\"});"
@@ -922,6 +943,17 @@ class SkylineCharm(ops.CharmBase):
             text = text.replace("\n// PATCHED: KUBECONFIG_PATCHED_V1\n", "")
             markers_stripped = text != orig
             changed = markers_stripped
+
+            # 2d: allowedCheckFunc upgrade — broaden the button's visibility
+            # from CREATE_COMPLETE-only to every healthy completion state. On an
+            # already-patched unit module 9999 already exists (so 2a skips), so
+            # this targeted in-place replace is what upgrades the deployed
+            # bundle to keep the button after resize/update. Idempotent: once
+            # replaced, allowed_old no longer matches.
+            if allowed_old in text:
+                text = text.replace(allowed_old, allowed_new, 1)
+                changed = True
+                logger.info("Broadened Download Kubeconfig allowedCheckFunc: %s", bundle_file.name)
 
             # 2c: store method (must come before module injection since it's
             # a simple string replacement on existing code)
