@@ -267,7 +267,7 @@ juju deploy ./skyline_ubuntu-22.04-amd64.charm skyline \
   --config system-user-password="THE_PASSWORD_YOU_SET_ABOVE" \
   --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
   -n 3 --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B
-juju deploy mysql-router skyline-mysql-router --channel 8.0/stable
+juju deploy mysql-router skyline-mysql-router --channel 8.0/stable --base ubuntu@22.04
 
 juju integrate skyline-mysql-router:db-router    mysql-innodb-cluster:db-router
 juju integrate skyline-mysql-router:certificates vault:certificates
@@ -283,6 +283,14 @@ Notes:
   directive per unit and spread them across machines for real HA.
 - Relating while the units are still installing gives the cleanest ordering;
   relating later also works.
+- **`--base ubuntu@22.04` pins the mysql-router subordinate's base** to match
+  the charm's (Ubuntu 22.04). The `8.0/stable` channel's newest revision
+  defaults to `ubuntu@24.04`; without the pin, on a 22.04 model the
+  `shared-db` relation fails with *"subordinate must support principal
+  application's base"* and skyline never gets a database (login shows no
+  region). If you already deployed the router and hit this, remove it
+  (`juju remove-application skyline-mysql-router --force`), redeploy with the
+  `--base` pin, and re-add the three `integrate` commands below.
 - Expected transient statuses during bring-up:
   - `Waiting for mysql-router to publish database credentials` — router still
     bootstrapping against the cluster
@@ -485,8 +493,13 @@ juju integrate mysql-innodb-cluster:vault vault:certificates              # rout
 **Step 1 — Deploy the router subordinate**
 
 ```bash
-juju deploy mysql-router skyline-mysql-router --channel 8.0/stable
+juju deploy mysql-router skyline-mysql-router --channel 8.0/stable --base ubuntu@22.04
 ```
+
+The `--base ubuntu@22.04` pin matches the mysql-router subordinate to the
+charm's base (Ubuntu 22.04); without it the newest `8.0/stable` revision
+defaults to `ubuntu@24.04` and the `shared-db` relation fails with *"subordinate
+must support principal application's base"*.
 
 **Step 2 — Wire up the relations (all three are required)**
 
