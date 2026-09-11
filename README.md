@@ -55,7 +55,7 @@ design.
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`, `patch-frontend`, `patch-kubeconfig`
-- **Unit tests:** 93 tests covering helpers, nginx injection, JS patching,
+- **Unit tests:** 95 tests covering helpers, nginx injection, JS patching,
   actions, lifecycle events, and relations (run with `py -3 -m pytest tests/`)
 
 **Remaining / planned**
@@ -95,7 +95,7 @@ skyline-charm/
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
 │   │   offline_proof.sh, check_db.sh
 │   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
-├── tests/                             # unit tests (offline, 93 tests)
+├── tests/                             # unit tests (offline, 95 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
 │   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config tests
@@ -355,7 +355,7 @@ service-url updates.
 | `system-user-domain` | `admin_domain` | Domain of the service user |
 | `system-project` | `admin` | Admin project name |
 | `system-project-domain` | `admin_domain` | Domain of the admin project |
-| `interface-type` | `public` | Endpoint interface (public/internal/admin) |
+| `interface-type` | `public` | Endpoint interface used by the APIServer: `public`, `internal`, or `admin` (see [Endpoint interface resolution](#endpoint-interface-resolution-interface-type)) |
 | `listen-port` | `9999` | nginx listener port |
 | `debug` | `false` | Enable debug logging |
 | `ssl-enabled` | `false` | Enable SSL flag in skyline.yaml |
@@ -370,6 +370,41 @@ service-url updates.
 | `reclaim-instance-interval` | `604800` | Deleted instance reclaim (seconds) |
 | `gunicorn-workers` | `0` | Workers (0 = auto from cpu_count) |
 | `gunicorn-timeout` | `300` | gunicorn worker timeout |
+
+### Endpoint interface resolution (`interface-type`)
+
+`interface-type` selects which endpoint of each service in the Keystone
+catalog Skyline uses. It affects:
+
+- the Keystone URL used for login and every server-side Keystone call
+  (the identity endpoint),
+- all other server-side service clients (nova, glance, cinder, neutron, ...),
+- the nginx proxy routes generated from the catalog — every
+  `/api/openstack/<region>/<service>/` location targets the real endpoint of
+  this interface,
+- the region list on the login page (regions are collected from every
+  cataloged service).
+
+Matching is an **exact interface match** (keystoneauth1) with **no fallback**:
+if the cloud does not publish the configured interface for a service, that
+service fails. If the *identity* service lacks it, login itself fails with 401
+`Endpoint not found`; if only another service lacks it, only that service's
+pages are affected. A non-empty region list does **not** prove the identity
+endpoint exists — regions are aggregated across all services, so the login
+call is the true test.
+
+Check what the cloud publishes:
+
+```bash
+openstack endpoint list --service keystone -c Interface -c URL
+openstack endpoint list --service container-infra -c Interface -c URL
+```
+
+When the cloud publishes all three interfaces (the common case), switching
+`interface-type` is functionally transparent — only the upstream URLs change
+(e.g. admin Keystone `:35357` vs public `:5000`). After a change the
+config-changed hook re-renders `skyline.yaml` and regenerates nginx; force it
+manually with `juju run skyline regenerate-nginx --wait`.
 
 ---
 
@@ -466,6 +501,14 @@ config time (idempotent — safe to run repeatedly):
    As with the other patches it is idempotent (a stale marker is stripped and
    the file re-patched). Stale `.gz` companions are deleted after patching so
    `gzip_static` never serves the pre-compressed unpatched bundles.
+
+   > **Known limitation:** the injected endpoint discovers the Magnum
+   > (`container-infra`) endpoint with the `public` interface hardcoded,
+   > independently of the `interface-type` config option. On a cloud whose
+   > Magnum catalog has **no public endpoint**, "Download Kubeconfig" returns
+   > HTTP 502 `container-infra endpoint not found in catalog`. Clouds that
+   > publish a public Magnum endpoint (the common case) are unaffected. Check
+   > with `openstack endpoint list --service container-infra -c Interface -c URL`.
 
 ---
 
@@ -807,6 +850,56 @@ journalctl -u skyline-apiserver --no-pager -n 50
 openstack role add --project admin --user skyline admin
 ```
 
+**Login page shows no region (empty region dropdown).**
+
+The dropdown is populated by the console calling
+`/api/v1/contrib/regions`; that endpoint authenticates to Keystone with the
+`system-user-*` credentials and reads the service catalog, so no regions means
+that call failed or returned nothing.
+
+Most common cause: the `skyline` user exists with the correct password but is
+missing the project-scoped `admin` role (the system-scope `Admin` grant is
+needed as well for some admin panels). Verify on the cloud:
+
+```bash
+openstack role assignment list --user skyline --names
+# expect: admin on project admin + Admin at system scope
+```
+
+On a unit, the HTTP response body carries the exact error — the apiserver
+does **not** log it, so `/var/log/skyline` stays quiet:
+
+```bash
+juju ssh skyline/0 -- 'curl -s http://127.0.0.1:28000/api/v1/contrib/regions'
+```
+
+- `{"detail": "..."}` with HTTP 401/500 → authentication or connectivity
+  failure (wrong password, missing role/domain, Keystone unreachable or TLS).
+- `[]` with HTTP 200 → auth works, but the catalog has no endpoints for the
+  configured `interface-type` (see
+  [Endpoint interface resolution](#endpoint-interface-resolution-interface-type)).
+
+Fix the roles, then regenerate nginx and reload the login page:
+
+```bash
+openstack role add --project admin --user skyline admin
+openstack role add --user skyline --user-domain admin_domain --system all Admin
+juju run skyline regenerate-nginx --wait
+```
+
+Which upstream URLs nginx actually uses (admin vs public vs internal):
+
+```bash
+juju ssh skyline/0 -- 'sudo grep "proxy_pass http" /etc/nginx/nginx.conf'
+```
+
+For a historical view of failing calls (the error detail itself is only in the
+response body above, not in this log):
+
+```bash
+juju ssh skyline/0 -- "sudo grep ' 500 ' /var/log/nginx/skyline_access.log"
+```
+
 **`juju refresh --path` fails to parse the file.**
 Prefix the path with `./` (a bare filename is treated as a charmstore URL):
 ```bash
@@ -927,7 +1020,7 @@ each one.
 
 ## Testing
 
-93 local unit tests cover the charm's logic layer — helper functions, nginx
+95 local unit tests cover the charm's logic layer — helper functions, nginx
 injection, JS bundle patching, action handlers, lifecycle events, and relation
 handlers. They run entirely offline (no Juju/MAAS required) and mock all
 subprocess calls.
