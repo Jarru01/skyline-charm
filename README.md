@@ -60,7 +60,8 @@ design.
 
 **Remaining / planned**
 
-- **TLS termination** at the access layer (VIP currently HTTP `:80` only)
+- **TLS termination** at the access layer (VIP serves HTTP `:80` by default;
+  optional how-to: [TLS termination at the VIP](#tls-termination-at-the-vip))
 
 ---
 
@@ -751,6 +752,48 @@ Rendered topology (per unit): `:80` tcp → peer haproxy units on `:81`
 (active/backup), `:81` http → `skyline_be` = all skyline units with
 `httpchk GET /healthz` (`inter 10s rise 2 fall 3`). Stats on `:10000`
 (localhost-only by default).
+
+### TLS termination at the VIP
+
+TLS is terminated at HAProxy; the skyline units keep serving plain HTTP on
+`9999` and the `website` relation is unchanged — no skyline charm change is
+required.
+
+1. Obtain a certificate for a name that resolves to the VIP (preferred), or
+   one with the VIP in its **IP SAN** (browsers reject CN-only-IP certs).
+2. Load it into the haproxy application (base64; `SELFSIGNED` gives a
+   throwaway self-signed cert):
+
+   ```bash
+   juju config haproxy ssl_cert="$(base64 -w0 fullchain.pem)" \
+                      ssl_key="$(base64 -w0 privkey.pem)"
+   # quick test only:
+   # juju config haproxy ssl_cert=SELFSIGNED
+   ```
+
+3. Move the skyline service to `443` and attach the default certificate.
+   Backends stay `<skyline-unit>:9999` plain HTTP over the internal network:
+
+   ```bash
+   juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 443, "crts": ["DEFAULT"], "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s", "http-request add-header X-Forwarded-Proto https if { ssl_fc }"], "server_options": "check inter 10s rise 2 fall 3"}]'
+   ```
+
+4. Open TCP/443 wherever TCP/80 is allowed. `keepalived`/the VIP need no
+   change — `443` binds on every haproxy unit and fails over like `80`.
+
+Verify:
+
+```bash
+curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/healthz   # 200
+```
+
+Caveats:
+
+- The legacy haproxy charm keeps the certificate as static config; renewal
+  means re-running the `juju config` commands above (or integrating the
+  certbot charm for automated issuance).
+- If SSO is enabled, also `juju config skyline ssl-enabled=true` so Skyline
+  builds `https` origin URLs.
 
 ### Failover test results (T1–T5)
 
