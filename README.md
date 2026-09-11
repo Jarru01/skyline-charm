@@ -973,6 +973,20 @@ charm uses `must-revalidate` cache headers, but older deployments may have
 and hard-refresh, or run `juju run skyline regenerate-nginx --wait` to
 update the nginx config with the correct cache headers.
 
+**Network → Topology is empty (console: `e.subnetNodes[d] is undefined`).**
+Upstream Skyline console bug (5.0.1), not a charm or API problem — all five
+topology API calls return 200. The renderer builds subnet nodes only for
+internal networks, so a cloud with **only external networks** leaves
+`subnetNodes` empty; instances whose fixed IPs fall in an external subnet
+pool then throw
+`TypeError: can't access property "cardY", e.subnetNodes[d] is undefined`
+and the graph never renders. Workaround: create one internal network with a
+subnet — the graph then renders. External networks are always drawn as the
+single top `extNet` bar (no per-network nodes); instances/routers attached
+to them are still drawn, connected to that bar. A proper fix needs a JS
+patch to `network.bundle` (guarding the `subnetNodes[0]`/`subnetNodes[d]`
+accesses) or an upstream Skyline fix.
+
 ---
 
 ## Upgrading
