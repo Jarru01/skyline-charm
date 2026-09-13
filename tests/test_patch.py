@@ -1,11 +1,16 @@
-"""Tests for JS bundle patching (container-infra, main, kubeconfig endpoint)."""
+"""Tests for JS bundle patching (container-infra, main, network topology, kubeconfig)."""
 
 from pathlib import Path
 
 import pytest
 
 from charm import SkylineCharm, _KUBECONFIG_ENDPOINT_SRC
-from helpers import make_apiserver_venv, make_bundle_file, make_main_bundle_file
+from helpers import (
+    make_apiserver_venv,
+    make_bundle_file,
+    make_main_bundle_file,
+    make_network_bundle_file,
+)
 
 
 # ── Realistic fake bundle content for kubeconfig tests ────────────────────────
@@ -352,3 +357,53 @@ class TestKubeconfigEndpointSource:
         assert "async def get_cluster_kubeconfig" not in src
         assert "def get_cluster_kubeconfig(cluster_id" in src
         assert "10.11.1.48" not in src
+
+
+class TestPatchNetworkTopology:
+    """_patch_network_topology() guards the Topology renderer on external-only clouds."""
+
+    def test_guards_all_indexing_sites(self, harness_installed, static_dir):
+        """All three minified indexing sites get guarded fallbacks."""
+        make_network_bundle_file(static_dir)
+        harness_installed.charm._patch_network_topology()
+        result = (static_dir / "network.bundle.1786807402.js").read_text()
+        assert "f=(e.subnetNodes[0]||{cardY:190}).cardY," in result
+        assert "f=(e.subnetNodes[d]||{cardY:190}).cardY," in result
+        assert (
+            'var n,{style:{stroke:o}}=e.subnetNodes[d]||'
+            '{style:{stroke:"#9AC3FF"}},u=(e.subnetNodes[d]||{}).y||100;'
+        ) in result
+        assert "f=e.subnetNodes[0].cardY," not in result
+        assert "f=e.subnetNodes[d].cardY," not in result
+
+    def test_idempotent(self, harness_installed, static_dir):
+        """Second run leaves the patched bundle unchanged."""
+        make_network_bundle_file(static_dir)
+        charm = harness_installed.charm
+        charm._patch_network_topology()
+        first = (static_dir / "network.bundle.1786807402.js").read_text()
+        charm._patch_network_topology()
+        second = (static_dir / "network.bundle.1786807402.js").read_text()
+        assert first == second
+        assert second.count("||{cardY:190}") == 2
+
+    def test_noop_without_anchors(self, harness_installed, static_dir):
+        """A bundle without the vulnerable anchors is left untouched."""
+        path = make_network_bundle_file(static_dir, content="var unrelated=1;")
+        harness_installed.charm._patch_network_topology()
+        assert path.read_text() == "var unrelated=1;"
+
+    def test_removes_gz_companion(self, harness_installed, static_dir):
+        """Stale .gz file is deleted after patching the .js."""
+        js_path = make_network_bundle_file(static_dir)
+        gz_path = js_path.with_suffix(js_path.suffix + ".gz")
+        gz_path.write_bytes(b"fake gzip content")
+        harness_installed.charm._patch_network_topology()
+        assert not gz_path.exists()
+        assert js_path.exists()
+
+    def test_noop_when_static_path_empty(self, harness):
+        """No-op when static_path is not yet discovered."""
+        harness.begin()
+        harness.charm._stored.static_path = ""
+        harness.charm._patch_network_topology()

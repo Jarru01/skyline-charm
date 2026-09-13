@@ -95,3 +95,18 @@ def make_apiserver_venv(tmp_path, init_content=None):
         )
     (v1_dir / "__init__.py").write_text(init_content, encoding="utf-8")
     return tmp_path / "venv" / "lib"
+
+
+def make_network_bundle_file(static_dir, filename="network.bundle.1786807402.js",
+                             content=None):
+    """Create a fake network bundle JS file with the Topology indexing sites."""
+    if content is None:
+        content = (
+            "function z(e,d){if(!d[0]){f=e.subnetNodes[0].cardY,l.push([c,f]);}"
+            "if(s){f=e.subnetNodes[d].cardY,l.push([c,f]);}"
+            "s&&function(){var n,{style:{stroke:o}}=e.subnetNodes[d],"
+            "u=e.subnetNodes[d].y;u<f&&(p+=1);}}"
+        )
+    path = static_dir / filename
+    path.write_text(content, encoding="utf-8")
+    return path

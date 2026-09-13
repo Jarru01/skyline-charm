@@ -990,6 +990,77 @@ class SkylineCharm(ops.CharmBase):
         if patched:
             logger.info("Patched %d bundle(s) for kubeconfig download — nginx reload recommended", patched)
 
+    # ── Network topology (external-only clouds) ─────────────────────────────
+
+    def _patch_network_topology(self):
+        """Guard the upstream Topology renderer against an empty subnetNodes.
+
+        ``renderNetworkNode()`` builds subnet nodes only for **non-external**
+        networks (external networks are collapsed into the single top
+        ``extNet`` bar). On a cloud with only external networks, instances
+        whose fixed IPs fall in an external subnet pool then hit an empty
+        ``data.subnetNodes`` and ``renderInstanceNode()`` indexes it blindly
+        (``subnetNodes[0]`` / ``subnetNodes[d]``), raising a TypeError that
+        aborts the whole graph render.
+
+        This patch replaces the three minified indexing sites with guarded
+        fallbacks so the graph renders (``extNet`` bar + instance nodes) on
+        such clouds. Clouds with internal networks keep their exact previous
+        behaviour. Pattern-based and idempotent; anchors are verified against
+        the bundled console wheel (5.0.1).
+        """
+        static = self._stored.static_path
+        if not static:
+            return
+        static_dir = Path(static)
+        replacements = (
+            (
+                "f=e.subnetNodes[0].cardY,",
+                "f=(e.subnetNodes[0]||{cardY:190}).cardY,",
+            ),
+            (
+                "f=e.subnetNodes[d].cardY,",
+                "f=(e.subnetNodes[d]||{cardY:190}).cardY,",
+            ),
+            (
+                "var n,{style:{stroke:o}}=e.subnetNodes[d],"
+                "u=e.subnetNodes[d].y;",
+                "var n,{style:{stroke:o}}=e.subnetNodes[d]||"
+                '{style:{stroke:"#9AC3FF"}},'
+                "u=(e.subnetNodes[d]||{}).y||100;",
+            ),
+        )
+        patched = 0
+        for bundle_file in static_dir.glob("network.bundle.*.js"):
+            try:
+                text = bundle_file.read_text(encoding="utf-8")
+            except Exception:
+                logger.warning("Could not read %s", bundle_file)
+                continue
+            orig = text
+            found = sum(1 for old, _ in replacements if old in text)
+            for old, new in replacements:
+                if old in text:
+                    text = text.replace(old, new, 1)
+            if text != orig:
+                bundle_file.write_text(text, encoding="utf-8")
+                patched += 1
+                logger.info(
+                    "Guarded topology renderer against empty subnetNodes "
+                    "(%d replacement(s)): %s", found, bundle_file.name,
+                )
+            elif "||{cardY:190}" not in text:
+                logger.warning(
+                    "Topology patch: expected anchors not found in %s — "
+                    "console bundle changed?", bundle_file.name,
+                )
+        self._remove_stale_gz_files(static_dir)
+        if patched:
+            logger.info(
+                "Patched %d bundle(s) for external-only topology — "
+                "nginx reload recommended", patched,
+            )
+
     # ── Kubeconfig backend endpoint ───────────────────────────────────────
 
     def _patch_kubeconfig_endpoint(self, venv_lib: Path = Path("/opt/skyline-venv/lib")):
@@ -1431,6 +1502,7 @@ class SkylineCharm(ops.CharmBase):
             return False
         self._patch_container_infra_bundle()
         self._patch_magnum_kubeconfig()
+        self._patch_network_topology()
         self._patch_kubeconfig_endpoint()
         self._publish_shared_db_request()
 

@@ -1,5 +1,7 @@
 # Skyline Juju Charm
 
+[![CI](https://github.com/Jarru01/skyline-charm/actions/workflows/ci.yaml/badge.svg)](https://github.com/Jarru01/skyline-charm/actions/workflows/ci.yaml)
+
 Deploys **OpenStack Skyline Dashboard** (stable/2024.2) inside an LXD
 container:
 
@@ -55,7 +57,7 @@ design.
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`, `patch-frontend`, `patch-kubeconfig`
-- **Unit tests:** 95 tests covering helpers, nginx injection, JS patching,
+- **Unit tests:** 100 tests covering helpers, nginx injection, JS patching,
   actions, lifecycle events, and relations (run with `py -3 -m pytest tests/`)
 
 **Remaining / planned**
@@ -96,7 +98,7 @@ skyline-charm/
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
 │   │   offline_proof.sh, check_db.sh
 │   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
-├── tests/                             # unit tests (offline, 95 tests)
+├── tests/                             # unit tests (offline, 100 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
 │   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config tests
@@ -453,14 +455,14 @@ config time (idempotent — safe to run repeatedly):
    its `init()` — it never calls `getQuota()`, so the buggy
    `checkVolumeQuota()` code path is never reached.
 
-2. **nginx generator timeout:** The keystone catalog query in the nginx
+3. **nginx generator timeout:** The keystone catalog query in the nginx
    generator now has a 120-second timeout. If the generator hangs (e.g.
    keystone unreachable), the charm falls back to the static
    `templates/nginx.conf.j2` instead of blocking the Juju hook forever.
    Previously, a hung generator would leave units stuck in
    `MaintenanceStatus("Generating nginx config from keystone catalog")`.
 
-3. **Static-asset cache-control:** The charm injects a `location ~*` block
+4. **Static-asset cache-control:** The charm injects a `location ~*` block
    into the generated nginx config with `Cache-Control: public, must-revalidate`
    (7-day expiry). This ensures browsers always revalidate static files
    with the server via ETag/Last-Modified before using a cached copy. This
@@ -468,7 +470,7 @@ config time (idempotent — safe to run repeatedly):
    filename), so without `must-revalidate`, browsers would serve stale
    cached versions until the expiry elapsed.
 
-4. **Download Kubeconfig button (`patch-kubeconfig`):** Adds a working
+5. **Download Kubeconfig button (`patch-kubeconfig`):** Adds a working
    "Download Kubeconfig" action to every cluster row/detail menu in the
    Magnum dashboard. Upstream Skyline calls Magnum's
    `/v1/clusters/{id}/config`, which does **not exist** in this deployment
@@ -510,6 +512,18 @@ config time (idempotent — safe to run repeatedly):
    > HTTP 502 `container-infra endpoint not found in catalog`. Clouds that
    > publish a public Magnum endpoint (the common case) are unaffected. Check
    > with `openstack endpoint list --service container-infra -c Interface -c URL`.
+
+6. **Network topology crash on external-only clouds:** Upstream
+   `renderInstanceNode()` indexes `data.subnetNodes` blindly, but
+   `renderNetworkNode()` only builds subnet nodes for **non-external**
+   networks (external networks are collapsed into the single top `extNet` bar
+   at the top). On a cloud with only external networks the array is empty, so
+   instances whose fixed IPs fall in an external subnet pool hit
+   `subnetNodes[0]` / `subnetNodes[d]` and the whole graph render aborts with
+   `TypeError: e.subnetNodes[d] is undefined`. The charm guards the three
+   indexing sites with fallbacks, so the `extNet` bar and the instance nodes
+   still render. Clouds with internal networks are unaffected — the guards
+   never trigger.
 
 ---
 
@@ -974,18 +988,22 @@ and hard-refresh, or run `juju run skyline regenerate-nginx --wait` to
 update the nginx config with the correct cache headers.
 
 **Network → Topology is empty (console: `e.subnetNodes[d] is undefined`).**
-Upstream Skyline console bug (5.0.1), not a charm or API problem — all five
-topology API calls return 200. The renderer builds subnet nodes only for
-internal networks, so a cloud with **only external networks** leaves
-`subnetNodes` empty; instances whose fixed IPs fall in an external subnet
-pool then throw
-`TypeError: can't access property "cardY", e.subnetNodes[d] is undefined`
-and the graph never renders. Workaround: create one internal network with a
-subnet — the graph then renders. External networks are always drawn as the
-single top `extNet` bar (no per-network nodes); instances/routers attached
-to them are still drawn, connected to that bar. A proper fix needs a JS
-patch to `network.bundle` (guarding the `subnetNodes[0]`/`subnetNodes[d]`
-accesses) or an upstream Skyline fix.
+Fixed automatically by the charm — the `network.bundle` guard patch runs at
+config time (see [Frontend patches](#frontend-patches-applied-automatically)).
+If you still see an empty graph, confirm the patch is on the unit and
+hard-refresh the browser:
+
+```bash
+juju ssh skyline/0 -- "sudo grep -c '||{cardY:190}' /opt/skyline-venv/lib/python3.10/site-packages/skyline_console/static/network.bundle.*.js"
+# expect: 1
+```
+
+Background: upstream `renderInstanceNode()` indexes `data.subnetNodes`, which
+is empty when the project has only external networks (all five topology API
+calls still return 200). External networks always render as the single top
+`extNet` bar; instances/routers attached to them are drawn connected to that
+bar. On charm revisions without the patch, create one internal network with a
+subnet as a workaround.
 
 ---
 
@@ -1077,7 +1095,7 @@ each one.
 
 ## Testing
 
-95 local unit tests cover the charm's logic layer — helper functions, nginx
+100 local unit tests cover the charm's logic layer — helper functions, nginx
 injection, JS bundle patching, action handlers, lifecycle events, and relation
 handlers. They run entirely offline (no Juju/MAAS required) and mock all
 subprocess calls.
