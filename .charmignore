@@ -1,6 +1,7 @@
 # Keep the packed charm lean — these are build-only / local-only artifacts.
 .tmp/
 other/
+.github/
 .git/
 *.charm
 __pycache__/

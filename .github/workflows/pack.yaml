@@ -1,0 +1,26 @@
+name: Pack
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  charm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install charmcraft
+        run: sudo snap install charmcraft --classic
+      - name: Pack charm
+        run: charmcraft pack --destructive-mode
+      - name: Verify bundled artifacts
+        run: |
+          unzip -l skyline_ubuntu-22.04-amd64.charm | grep -E 'whl|tar.gz'
+          sha256sum skyline_ubuntu-22.04-amd64.charm
+      - name: Upload charm
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyline-charm
+          path: skyline_ubuntu-22.04-amd64.charm
