@@ -18,7 +18,9 @@ options:
       Create it with:
         openstack user create --domain admin_domain --password-prompt skyline
         openstack role add --project admin --user skyline admin
-        openstack role add --user skyline --user-domain admin_domain --system all Admin
+        openstack role add --user skyline --user-domain admin_domain --system all admin
+      The roles must be lowercase 'admin' (oslo.policy role matching is
+      case-sensitive; rename Juju's stock 'Admin' role first).
       The system-scope grant is required by system-scoped admin APIs;
       without it some administrator panels return 403 / empty data.
 

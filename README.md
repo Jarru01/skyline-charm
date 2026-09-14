@@ -238,8 +238,13 @@ openstack role add --project admin --user skyline admin
 
 # System-scope grant: required by system-scoped admin APIs. Without it,
 # some administrator panels return 403 / empty data.
-openstack role add --user skyline --user-domain admin_domain --system all Admin
+openstack role add --user skyline --user-domain admin_domain --system all admin
 ```
+
+> The role must be lowercase `admin`: on stock Juju deployments the role is
+> created as `Admin` and has to be renamed first — oslo.policy role matching is
+> case-sensitive, and with the uppercase name the Skyline admin panels stay
+> read-only/empty even though login works.
 
 ## Step 5 — Deploy
 
@@ -278,7 +283,7 @@ Notes:
 - **Password:** generated and owned by the keystone charm; read it with
   `juju run skyline show-config` (or `juju show-unit skyline/0`).
 - **Existing users:** the first relation processing rewrites the user's
-  password (one-time). Role grants are merged; the system-scope `Admin` grant
+  password (one-time). Role grants are merged; the system-scope `admin` grant
   from Step 4 is unrelated and stays recommended for full admin panels.
 - **Wrong project/domain creates a second user** — keep the defaults or set
   the options to match your cloud.
@@ -910,12 +915,12 @@ The dropdown is populated by the console calling
 that call failed or returned nothing.
 
 Most common cause: the `skyline` user exists with the correct password but is
-missing the project-scoped `admin` role (the system-scope `Admin` grant is
+missing the project-scoped `admin` role (the system-scope `admin` grant is
 needed as well for some admin panels). Verify on the cloud:
 
 ```bash
 openstack role assignment list --user skyline --names
-# expect: admin on project admin + Admin at system scope
+# expect: admin on project admin + admin at system scope
 ```
 
 On a unit, the HTTP response body carries the exact error — the apiserver
@@ -935,7 +940,7 @@ Fix the roles, then regenerate nginx and reload the login page:
 
 ```bash
 openstack role add --project admin --user skyline admin
-openstack role add --user skyline --user-domain admin_domain --system all Admin
+openstack role add --user skyline --user-domain admin_domain --system all admin
 juju run skyline regenerate-nginx
 ```
 
