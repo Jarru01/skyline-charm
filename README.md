@@ -45,7 +45,7 @@ design.
 - Prometheus monitoring — set `prometheus-endpoint` and the console Monitor
   pages are populated. Each unit queries the same Prometheus API
   independently, so adding skyline units does **not** affect monitoring.
-- **Multi-unit cold start:** three units deployed at once (`Step 5b`) complete
+- **Multi-unit cold start:** three units deployed at once (`Step 5a`) complete
   hands-off — routers bootstrap cleanly, transient Waiting statuses appear as
   designed, exactly one unit runs the Alembic migration (leader-gated) while
   the others follow no-op, per-host grants are auto-created. The single-node
@@ -220,7 +220,11 @@ charmcraft pack                  # add --destructive-mode when packing on a bare
 unzip -l skyline_ubuntu-22.04-amd64.charm | grep -E 'whl|tar.gz'
 ```
 
-## Step 4 — Create the OpenStack skyline service user
+## Step 4 — Create the skyline OpenStack user (explicit-credentials path only)
+
+Skip this step when using the recommended `identity-credentials` relation in
+**Step 5a** — the keystone charm creates the user and its password
+automatically.
 
 ```bash
 source /etc/kolla/admin-openrc.sh   # adjust to your openrc path
@@ -239,7 +243,76 @@ openstack role add --user skyline --user-domain admin_domain --system all Admin
 
 ## Step 5 — Deploy
 
-### 5a — Single unit
+### 5a — Via the `identity-credentials` relation (recommended)
+
+Prerequisite: a healthy `mysql-innodb-cluster` + vault, and the keystone charm
+(see [Database backends](#database-backends)). Deploy everything up front and
+wire the relations immediately — no Keystone credentials are configured
+manually:
+
+```bash
+juju deploy ./skyline_ubuntu-22.04-amd64.charm skyline \
+  --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
+  -n 3 --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B
+juju deploy mysql-router skyline-mysql-router --channel 8.0/stable --base ubuntu@22.04
+
+juju integrate skyline-mysql-router:db-router    mysql-innodb-cluster:db-router
+juju integrate skyline-mysql-router:certificates vault:certificates
+juju integrate skyline:shared-db                 skyline-mysql-router:shared-db
+
+juju integrate skyline:identity-credentials keystone:identity-credentials
+```
+
+The keystone charm creates (or reuses) the user named by `identity-username`
+(default `skyline`) in the project/domain given by `identity-project` /
+`identity-project-domain` (defaults `admin` / `admin_domain`), grants its
+admin role there, and publishes the public Keystone endpoint plus the
+generated password back over the relation.
+
+Notes:
+
+- **Keystone config is not needed.** When the relation has complete data it
+  **wins** over `keystone-url`, `system-user-password`, `system-user-*`,
+  `system-project*` and `default-region`; remove the relation to fall back to
+  the config values.
+- **Password:** generated and owned by the keystone charm; read it with
+  `juju run skyline show-config` (or `juju show-unit skyline/0`).
+- **Existing users:** the first relation processing rewrites the user's
+  password (one-time). Role grants are merged; the system-scope `Admin` grant
+  from Step 4 is unrelated and stays recommended for full admin panels.
+- **Wrong project/domain creates a second user** — keep the defaults or set
+  the options to match your cloud.
+- The relation only exists on Juju-managed OpenStack clouds; use **5b**
+  elsewhere.
+- **`integrate` vs `relate`:** both work on Juju 3.x — `relate` is kept as a
+  legacy alias of `integrate`. This guide standardizes on `integrate`.
+- **`--to` is mandatory on MAAS** — without placement directives Juju asks
+  MAAS for brand-new machines and hangs on *"waiting for machine"*. Give one
+  directive per unit and spread them across machines for real HA.
+- **`--base ubuntu@22.04` pins the mysql-router subordinate's base** to match
+  the charm's (Ubuntu 22.04). The `8.0/stable` channel's newest revision
+  defaults to `ubuntu@24.04`; without the pin, on a 22.04 model the
+  `shared-db` relation fails with *"subordinate must support principal
+  application's base"* and skyline never gets a database (login shows no
+  region). If you already deployed the router and hit this, remove it
+  (`juju remove-application skyline-mysql-router --force`), redeploy with the
+  `--base` pin, and re-add the three `integrate` commands above.
+- Expected transient statuses during bring-up:
+  - `Waiting for mysql-router to publish database credentials` — router still
+    bootstrapping against the cluster
+  - `Waiting for Keystone credentials (identity-credentials)` — the keystone
+    charm has not published credentials yet
+  - `Waiting for leader to migrate database schema` on non-leader units —
+    exactly **one** unit runs the real Alembic migration, the rest follow
+    with a no-op, so parallel cold starts can never race DDL
+
+For a single-unit lab deployment, drop `-n 3 --to ...` and the two
+`skyline-mysql-router` lines; the charm then manages a local MariaDB (see 5b).
+
+### 5b — With explicit credentials (fallback)
+
+Use this for non-Juju Keystone deployments, or when you manage the OpenStack
+user yourself (see Step 4):
 
 ```bash
 juju deploy ./skyline_ubuntu-22.04-amd64.charm \
@@ -249,95 +322,19 @@ juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --to lxd:1
 ```
 
-With no router relation, the charm installs and manages
-a **local MariaDB**. That instance deliberately binds **`127.0.0.1:13306`**,
-*not* 3306: the co-located `mysql-router` subordinate always owns
-`127.0.0.1:3306–3309`, so local DB and router can never collide regardless of
-hook ordering. Attaching a `mysql-router` `shared-db` relation later stops the
-local instance and moves the app to the cluster automatically.
+With no router relation the charm installs and manages a **local MariaDB**.
+That instance deliberately binds **`127.0.0.1:13306`**, *not* 3306: the
+co-located `mysql-router` subordinate always owns `127.0.0.1:3306–3309`, so
+local DB and router can never collide regardless of hook ordering. Attaching
+a `mysql-router` `shared-db` relation later stops the local instance and moves
+the app to the cluster automatically.
 
 > **`prometheus-endpoint` must include the scheme** (`http://...`). A bare
 > `host:port` makes the apiserver return HTTP 500 and the Monitor pages show
 > no data.
 
-### 5b — Multiple units from scratch (HA cold start)
-
-Prerequisite: a healthy `mysql-innodb-cluster` + vault (see
-[Using an External Database](#using-an-external-database)). Deploy everything
-up front and wire the relations immediately — the same order a bundle would
-use:
-
-```bash
-juju deploy ./skyline_ubuntu-22.04-amd64.charm skyline \
-  --config keystone-url="https://KEYSTONE_IP:5000/v3/" \
-  --config system-user-password="THE_PASSWORD_YOU_SET_ABOVE" \
-  --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
-  -n 3 --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B
-juju deploy mysql-router skyline-mysql-router --channel 8.0/stable --base ubuntu@22.04
-
-juju integrate skyline-mysql-router:db-router    mysql-innodb-cluster:db-router
-juju integrate skyline-mysql-router:certificates vault:certificates
-juju integrate skyline:shared-db                 skyline-mysql-router:shared-db
-```
-
-Notes:
-
-- **`integrate` vs `relate`:** both work on Juju 3.x — `relate` is kept as a
-  legacy alias of `integrate`. This guide standardizes on `integrate`.
-- **`--to` is mandatory on MAAS** — without placement directives Juju asks
-  MAAS for brand-new machines and hangs on *"waiting for machine"*. Give one
-  directive per unit and spread them across machines for real HA.
-- Relating while the units are still installing gives the cleanest ordering;
-  relating later also works.
-- **`--base ubuntu@22.04` pins the mysql-router subordinate's base** to match
-  the charm's (Ubuntu 22.04). The `8.0/stable` channel's newest revision
-  defaults to `ubuntu@24.04`; without the pin, on a 22.04 model the
-  `shared-db` relation fails with *"subordinate must support principal
-  application's base"* and skyline never gets a database (login shows no
-  region). If you already deployed the router and hit this, remove it
-  (`juju remove-application skyline-mysql-router --force`), redeploy with the
-  `--base` pin, and re-add the three `integrate` commands below.
-- Expected transient statuses during bring-up:
-  - `Waiting for mysql-router to publish database credentials` — router still
-    bootstrapping against the cluster
-  - `Waiting for leader to migrate database schema` on non-leader units —
-    exactly **one** unit runs the real Alembic migration, the rest follow
-    with a no-op, so parallel cold starts can never race DDL
-
-### 5c — Keystone discovery via the `identity-credentials` relation (optional)
-
-Instead of configuring `keystone-url` + `system-user-password`, the charm can
-obtain both from the keystone charm automatically:
-
-```bash
-juju deploy ./skyline_ubuntu-22.04-amd64.charm skyline \
-  --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
-  -n 3 --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B
-juju integrate skyline:identity-credentials keystone:identity-credentials
-```
-
-The keystone charm then creates (or reuses) the user named by
-`identity-username` (default `skyline`) in the project/domain given by
-`identity-project` / `identity-project-domain` (defaults `admin` /
-`admin_domain`), grants its admin role there, and publishes the public
-Keystone endpoint plus the generated password back over the relation.
-
-Notes:
-
-- **Precedence:** when the relation has complete data it **wins** over
-  `keystone-url`, `system-user-password`, `system-user-*`,
-  `system-project*` and `default-region`. Remove the relation to fall back to
-  the config values.
-- **Password:** generated and owned by the keystone charm; read it with
-  `juju run skyline show-config` (or `juju show-unit skyline/0`).
-- **Existing users:** the first relation processing rewrites the existing
-  user's password (one-time). Role grants are merged; the system-scope
-  `Admin` grant from Step 4 is not touched and stays recommended for the
-  admin panels.
-- **Wrong project/domain creates a second user** — keep the defaults or set
-  the options to match your cloud.
-- The relation only exists on Juju-managed OpenStack clouds; keep the config
-  values for other deployments.
+For multiple units, keep the explicit credentials and add the `mysql-router`
+relations shown in 5a — never scale with per-unit local MariaDB.
 
 ## Step 6 — Watch the deployment
 
@@ -567,9 +564,15 @@ config time (idempotent — safe to run repeatedly):
 
 ---
 
-## Using an External Database
+## Database backends
 
-### Via a mysql-router backed by mysql-innodb-cluster (recommended, HA-ready)
+Multi-unit (HA) deployments use a `mysql-router` subordinate co-located on
+each skyline unit, backed by `mysql-innodb-cluster` — the same path every
+other service in the model uses (this is what **Step 5a** wires up). A single
+unit with no router relation uses the charm-managed local MariaDB instead
+(**Step 5b**).
+
+### Via a mysql-router backed by mysql-innodb-cluster
 
 This is the production path used by every other service in the model: a
 `mysql-router` subordinate is co-located on each skyline unit and fronts a
@@ -669,7 +672,7 @@ Then log into `http://<UNIT_IP>:9999`.
 Skyline backends are **stateless** (gunicorn ASGI on `127.0.0.1:28000`, signed
 session tokens, no WebSockets), so you can run several units behind a load
 balancer without sticky sessions. (To stand up several units at once from
-nothing, use the cold-start recipe in **Step 5b** instead.)
+nothing, use the cold-start recipe in **Step 5a** instead.)
 
 ```bash
 juju deploy ./skyline_ubuntu-22.04-amd64.charm \
