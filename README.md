@@ -1032,6 +1032,34 @@ the first time the relation is processed, so a previously configured
 relation's URL and credentials always take precedence over the config values;
 remove the relation to fall back.
 
+**Removing Skyline (or scaling in) can wedge `mysql-innodb-cluster` / `vault`.**
+Every skyline unit carries a co-located `mysql-router` subordinate, so removing
+skyline units or the app also departs a router from `mysql-innodb-cluster`
+(`db-router`) and from `vault` (`certificates`). Those charms' old reactive
+`*-relation-departed` hooks can fail when the teardown races them
+(`relation-get ... permission denied`), and the failed hook is then retried by
+every `update-status` — the units show `hook failed: "...-relation-departed"`
+and/or a repeating `hook failed: "update-status"`. The database and vault keep
+serving (Skyline and the VIP stay up); only the unit status is wedged.
+
+Prefer a graceful removal — plain `juju remove-application skyline` (or
+`juju remove-unit skyline/N` for scale-in), **without `--force --no-wait`** —
+so Juju orders the router departure after its hooks.
+
+If a unit is already wedged, reboot the affected infrastructure units **one at a
+time**, waiting for each to return to `active` before rebooting the next:
+
+```bash
+juju ssh mysql-innodb-cluster/0 -- 'sudo reboot'   # then wait for: active idle
+juju ssh mysql-innodb-cluster/1 -- 'sudo reboot'
+juju ssh mysql-innodb-cluster/2 -- 'sudo reboot'
+juju ssh vault/0 -- 'sudo reboot'                  # only if vault is wedged
+```
+
+The reboot clears the stale relation state; no charm edits are needed. Verify
+with `juju status` — expect `Cluster is ONLINE and can tolerate up to ONE
+failure.` on the cluster and all units `active`.
+
 ---
 
 ## Upgrading
