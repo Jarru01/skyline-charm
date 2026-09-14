@@ -1,5 +1,5 @@
 options:
-  # ── Required ──────────────────────────────────────────────────────────
+  # ── Identity: explicit credentials (optional when the relation is used) ──
   keystone-url:
     type: string
     default: ""
@@ -8,6 +8,8 @@ options:
       The charm will append /v3/ if not already present.
       To find your endpoint:
         openstack endpoint list --service keystone --interface public
+      Not needed when the identity-credentials relation provides credentials
+      (see identity-username).
 
   system-user-password:
     type: string
@@ -23,6 +25,7 @@ options:
       case-sensitive; rename Juju's stock 'Admin' role first).
       The system-scope grant is required by system-scoped admin APIs;
       without it some administrator panels return 403 / empty data.
+      Not needed when the identity-credentials relation provides credentials.
 
   # ── Database ──────────────────────────────────────────────────────────
   database-password:

@@ -45,11 +45,15 @@ design.
 - Prometheus monitoring — set `prometheus-endpoint` and the console Monitor
   pages are populated. Each unit queries the same Prometheus API
   independently, so adding skyline units does **not** affect monitoring.
-- **Multi-unit cold start:** three units deployed at once (`Step 5a`) complete
-  hands-off — routers bootstrap cleanly, transient Waiting statuses appear as
-  designed, exactly one unit runs the Alembic migration (leader-gated) while
-  the others follow no-op, per-host grants are auto-created. The single-node
-  local-DB path is separately validated end-to-end on `127.0.0.1:13306`.
+- **Cold start via the identity relation (`Step 5a`):** validated end-to-end
+  on a fresh app — the first unit installs offline, the keystone charm creates
+  the service user and supplies the generated password, nginx is generated
+  from the catalog, and the unit reaches `active` hands-off. Units added later
+  re-run install and switch to the router-backed DB when their subordinate
+  publishes credentials; the leader-gated migration was observed
+  (`Waiting for leader to migrate database schema` on non-leaders). The
+  single-node local-DB path is separately validated end-to-end on
+  `127.0.0.1:13306`.
 - **LB health endpoint:** `GET /healthz` reflects *this unit's* apiserver
   liveness (200 up / 502 down), injected into both the generated and the
   fallback nginx configs
@@ -303,10 +307,17 @@ Notes:
   (`juju remove-application skyline-mysql-router --force`), redeploy with the
   `--base` pin, and re-add the three `integrate` commands above.
 - Expected transient statuses during bring-up:
+  - `blocked: Required config 'keystone-url' is not set` — only if the first
+    `config-changed` runs before the identity relation is added (e.g. you
+    `juju integrate` after the app settles); clears on integrate, no config
+    needed
   - `Waiting for mysql-router to publish database credentials` — router still
     bootstrapping against the cluster
   - `Waiting for Keystone credentials (identity-credentials)` — the keystone
     charm has not published credentials yet
+  - `Configuring local MariaDB` — briefly on units *added* to a router-backed
+    app, until their own co-located router joins (see
+    [Database backends](#database-backends))
   - `Waiting for leader to migrate database schema` on non-leader units —
     exactly **one** unit runs the real Alembic migration, the rest follow
     with a no-op, so parallel cold starts can never race DDL
@@ -642,9 +653,12 @@ Expected integrations once healthy (`juju status --relations`):
 
 > **Ordering is handled:** the moment the `shared-db` relation is *created* the
 > charm frees `127.0.0.1:3306` and waits (`Waiting for mysql-router to publish
-> database credentials`) until credentials arrive — it never starts local
-> MariaDB once related, so scaled-out units never race the router's bootstrap.
-> The charm also opens `listen-port` in Juju, so it appears in the
+> database credentials`) until credentials arrive. A unit *added* later to a
+> router-backed app may briefly configure against its own local MariaDB until
+> its co-located router subordinate joins (observed ~4 min in a cold scale-out
+> test), then stops it and switches to the cluster. Port collisions are
+> impossible by design: the local instance binds `127.0.0.1:13306`, never
+> 3306. The charm also opens `listen-port` in Juju, so it appears in the
 > `juju status` Ports column.
 
 **InnoDB Cluster primary-key note (error 3098)**
@@ -1047,8 +1061,8 @@ install
   ├─ apt-get: baseline packages + mariadb (if local DB)
   ├─ python3 -m venv /opt/skyline-venv
   ├─ offline upgrade of pip/setuptools/wheel from files/wheels
-  ├─ install apiserver wheel (--no-index --find-links --force-reinstall)
   ├─ extract bundled tarball → /opt/skyline-apiserver-src (for db_sync)
+  ├─ install apiserver wheel (--no-index --find-links --force-reinstall)
   ├─ install console wheel from files/
   ├─ discover + store console static path
   └─ verify venv deps (pip check self-heal)
