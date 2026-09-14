@@ -12,7 +12,6 @@ from charm import SkylineCharm
 VALID_CONFIG = {
     "keystone-url": "https://keystone.example.com:5000/v3/",
     "system-user-password": "test-password-123",
-    "database-url": "",
     "database-password": "",
     "default-region": "RegionOne",
     "system-user-name": "skyline",

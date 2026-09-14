@@ -77,12 +77,6 @@ class TestDatabaseUrl:
         assert "skyline" in url
         assert "pass123" in url
 
-    def test_from_config_when_no_relation(self, harness):
-        harness.begin()
-        harness.update_config({"database-url": "mysql://u:p@db-host:3306/sk"})
-        url = harness.charm._database_url()
-        assert url == "mysql://u:p@db-host:3306/sk"
-
     def test_local_db_localhost_13306(self, harness):
         harness.begin()
         url = harness.charm._database_url()

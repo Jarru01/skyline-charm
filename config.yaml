@@ -23,32 +23,12 @@ options:
       without it some administrator panels return 403 / empty data.
 
   # ── Database ──────────────────────────────────────────────────────────
-  database-url:
-    type: string
-    default: ""
-    description: |
-      Full SQLAlchemy database URL, e.g.:
-        mysql://skyline:PASS@10.0.0.2:3306/skyline
-      Leave empty (default) to have the charm install and manage a local
-      MariaDB instance inside the unit.
-      When a mysql-router 'shared-db' relation provides a database (the
-      recommended path for HA deployments), it takes precedence over this
-      config value.
-      When set, the charm skips local MariaDB and does NOT create the
-      database, user or grants externally — create them first or db_sync
-      will fail and the unit goes blocked.
-      'localhost'/'127.0.0.1' in the URL means the LXD unit itself; use the
-      LAN IP for a DB on the Juju host or another machine.
-      URL-encode special characters in the password (@ -> %40, # -> %23, ...).
-      MariaDB syntax above works for MariaDB; for MySQL 8 create the user
-      separately (CREATE USER ...; GRANT ...).
-
   database-password:
     type: string
     default: ""
     description: |
       Password for the local MariaDB skyline user.
-      Only used when database-url is empty (local MariaDB mode).
+      Only used for the local MariaDB (no mysql-router shared-db relation).
       If left empty, a random password is generated on first install and
       stored in the charm's StoredState.
 
@@ -76,7 +56,32 @@ options:
   system-project-domain:
     type: string
     default: "admin_domain"
-    description: Domain of the system project.
+    description: Domain of the admin project.
+
+  identity-username:
+    type: string
+    default: "skyline"
+    description: |
+      Username requested from the keystone charm over the
+      identity-credentials relation. Only used when the relation is present;
+      the keystone charm creates (or reuses) this service user and returns
+      its generated password.
+
+  identity-project:
+    type: string
+    default: "admin"
+    description: |
+      Project the identity-credentials user is created in / granted on.
+      Defaults to the admin project, which is what Skyline needs. Must match
+      an existing project, otherwise the keystone charm creates a new one.
+
+  identity-project-domain:
+    type: string
+    default: "admin_domain"
+    description: |
+      Domain of the identity-credentials user/project. Must match the domain
+      of the existing skyline user (default: admin_domain), otherwise a
+      second user is created in the given domain.
 
   interface-type:
     type: string

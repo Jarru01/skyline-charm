@@ -34,11 +34,6 @@ class TestUsingLocalDb:
         harness.begin()
         assert harness.charm._using_local_db() is True
 
-    def test_config_url_skips_local(self, harness):
-        harness.begin()
-        harness.update_config({"database-url": "mysql://u:p@h:3306/sk"})
-        assert harness.charm._using_local_db() is False
-
     def test_shared_db_takes_precedence(self, harness):
         harness.begin()
         rel_id = harness.add_relation("shared-db", "mysql-router")

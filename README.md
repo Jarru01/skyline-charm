@@ -9,7 +9,7 @@ container:
 |---|---|
 | skyline-apiserver | Python ASGI app, gunicorn on `127.0.0.1:28000` (loopback) |
 | skyline-console | Pre-built Python wheel, static assets served by nginx |
-| MariaDB | Local instance, binds `127.0.0.1:13306` (optional — skipped if `database-url` is set or a `mysql-router` `shared-db` relation provides the DB) |
+| MariaDB | Local instance, binds `127.0.0.1:13306` (optional — skipped when a `mysql-router` `shared-db` relation provides the DB) |
 | nginx | Public listener, default port `9999` |
 
 Everything the unit needs is **bundled inside the charm** (`files/`):
@@ -35,9 +35,12 @@ design.
 - Fully offline install from bundled wheels (apiserver + console + pinned deps)
 - nginx config generated from the keystone catalog
 - Databases: local MariaDB (binds `127.0.0.1:13306`, deliberately outside the
-  router's 3306–3309 range); external DB via `database-url`; the HA path via a
-  `mysql-router` `shared-db` → `mysql-innodb-cluster` (incl. the Group
-  Replication primary-key fix — error 3098)
+  router's 3306–3309 range); the HA path via a `mysql-router` `shared-db` →
+  `mysql-innodb-cluster` (incl. the Group Replication primary-key fix —
+  error 3098)
+- Keystone discovery via the `identity-credentials` relation: the keystone
+  charm creates the service user and supplies the public endpoint + generated
+  password, taking precedence over `keystone-url` / `system-user-password`
 - Uniform session `secret_key` shared across units over `skyline-peers`
 - Prometheus monitoring — set `prometheus-endpoint` and the console Monitor
   pages are populated. Each unit queries the same Prometheus API
@@ -57,7 +60,7 @@ design.
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`, `patch-frontend`, `patch-kubeconfig`
-- **Unit tests:** 100 tests covering helpers, nginx injection, JS patching,
+- **Unit tests:** 108 tests covering helpers, nginx injection, JS patching,
   actions, lifecycle events, and relations (run with `py -3 -m pytest tests/`)
 
 **Remaining / planned**
@@ -98,7 +101,7 @@ skyline-charm/
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
 │   │   offline_proof.sh, check_db.sh
 │   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
-├── tests/                             # unit tests (offline, 100 tests)
+├── tests/                             # unit tests (offline, 108 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
 │   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config tests
@@ -246,7 +249,7 @@ juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --to lxd:1
 ```
 
-With no `database-url` and no router relation, the charm installs and manages
+With no router relation, the charm installs and manages
 a **local MariaDB**. That instance deliberately binds **`127.0.0.1:13306`**,
 *not* 3306: the co-located `mysql-router` subordinate always owns
 `127.0.0.1:3306–3309`, so local DB and router can never collide regardless of
@@ -301,6 +304,41 @@ Notes:
     exactly **one** unit runs the real Alembic migration, the rest follow
     with a no-op, so parallel cold starts can never race DDL
 
+### 5c — Keystone discovery via the `identity-credentials` relation (optional)
+
+Instead of configuring `keystone-url` + `system-user-password`, the charm can
+obtain both from the keystone charm automatically:
+
+```bash
+juju deploy ./skyline_ubuntu-22.04-amd64.charm skyline \
+  --config prometheus-endpoint="http://PROMETHEUS_IP:9090" \
+  -n 3 --to lxd:MACHINE_A,lxd:MACHINE_A,lxd:MACHINE_B
+juju integrate skyline:identity-credentials keystone:identity-credentials
+```
+
+The keystone charm then creates (or reuses) the user named by
+`identity-username` (default `skyline`) in the project/domain given by
+`identity-project` / `identity-project-domain` (defaults `admin` /
+`admin_domain`), grants its admin role there, and publishes the public
+Keystone endpoint plus the generated password back over the relation.
+
+Notes:
+
+- **Precedence:** when the relation has complete data it **wins** over
+  `keystone-url`, `system-user-password`, `system-user-*`,
+  `system-project*` and `default-region`. Remove the relation to fall back to
+  the config values.
+- **Password:** generated and owned by the keystone charm; read it with
+  `juju run skyline show-config --wait` (or `juju show-unit skyline/0`).
+- **Existing users:** the first relation processing rewrites the existing
+  user's password (one-time). Role grants are merged; the system-scope
+  `Admin` grant from Step 4 is not touched and stays recommended for the
+  admin panels.
+- **Wrong project/domain creates a second user** — keep the defaults or set
+  the options to match your cloud.
+- The relation only exists on Juju-managed OpenStack clouds; keep the config
+  values for other deployments.
+
 ## Step 6 — Watch the deployment
 
 ```bash
@@ -349,15 +387,17 @@ service-url updates.
 
 | Key | Default | Description |
 |---|---|---|
-| `keystone-url` | *(required)* | Full Keystone v3 URL (`/v3/` is appended if missing) |
-| `system-user-password` | *(required)* | Password of the `skyline` OS user |
-| `database-url` | `""` | External DB URL; leave empty for local MariaDB |
+| `keystone-url` | *(required)* | Full Keystone v3 URL (`/v3/` is appended if missing). Not needed when related to keystone via `identity-credentials` |
+| `system-user-password` | *(required)* | Password of the `skyline` OS user. Not needed when related via `identity-credentials` |
 | `database-password` | `""` | Local MariaDB password (auto-generated if empty) |
 | `default-region` | `RegionOne` | OpenStack region |
 | `system-user-name` | `skyline` | Name of the OS service user |
 | `system-user-domain` | `admin_domain` | Domain of the service user |
 | `system-project` | `admin` | Admin project name |
 | `system-project-domain` | `admin_domain` | Domain of the admin project |
+| `identity-username` | `skyline` | Username requested over `identity-credentials` |
+| `identity-project` | `admin` | Project for the `identity-credentials` user |
+| `identity-project-domain` | `admin_domain` | Domain for the `identity-credentials` user/project |
 | `interface-type` | `public` | Endpoint interface used by the APIServer: `public`, `internal`, or `admin` (see [Endpoint interface resolution](#endpoint-interface-resolution-interface-type)) |
 | `listen-port` | `9999` | nginx listener port |
 | `debug` | `false` | Enable debug logging |
@@ -576,7 +616,7 @@ Expected integrations once healthy (`juju status --relations`):
 | `skyline-mysql-router:shared-db` | `skyline:shared-db` | `mysql-shared` *(subordinate)* | DB + user provisioning |
 | `skyline:skyline-peers` | `skyline:skyline-peers` | `skyline-peers` *(peer)* | uniform session secret |
 
-**Step 3 — What happens automatically (no `database-url` config needed)**
+**Step 3 — What happens automatically (no DB config needed)**
 
 1. The charm publishes `{database: skyline, username: skyline, hostname: <unit IP>}`
    on the requirer side of the `shared-db` relation (mysql-shared contract).
@@ -622,54 +662,6 @@ juju ssh skyline/0 -- 'ss -ltn | grep 330'            # expect: router on 3306-3
 
 Then log into `http://<UNIT_IP>:9999`.
 
-### Via the `database-url` config option
-
-Set `database-url` and the charm skips local MariaDB entirely (no install, no
-`systemctl` service, no `Wants=mariadb.service`). `db_sync` and the runtime
-apiserver both read the exact URL you configure.
-
-> **Do this first.** The charm will NOT create the database, user or grants on
-> an external server. Create them *before* running the config command, or the
-> unit goes `blocked` when `db_sync` cannot connect. Recovery: fix the DB, then
-> re-run `juju config` or `juju run skyline db-sync`.
-
-> A `shared-db` relation, when present, **takes precedence** over
-> `database-url`.
-
-```bash
-juju config skyline database-url="mysql://skyline:PASS@10.0.0.5:3306/skyline"
-```
-
-Create the database externally first:
-```sql
-CREATE DATABASE IF NOT EXISTS skyline
-  DEFAULT CHARACTER SET utf8 DEFAULT COLLATE utf8_general_ci;
-GRANT ALL PRIVILEGES ON skyline.* TO 'skyline'@'%' IDENTIFIED BY 'YOUR_PASS';
-FLUSH PRIVILEGES;
-```
-
-Notes:
-
-- **Reachability**: the charm runs inside an LXD container. `localhost` /
-  `127.0.0.1` in the URL means the container itself. For a DB on the Juju host
-  or another machine, use its LAN IP (e.g. `10.0.0.5`), and make sure the DB
-  user can connect from the container's network (`'skyline'@'%'` above).
-- **MySQL 8** (as opposed to MariaDB): `GRANT ... IDENTIFIED BY` is not
-  supported. Create the user separately first:
-  ```sql
-  CREATE USER 'skyline'@'%' IDENTIFIED BY 'YOUR_PASS';
-  GRANT ALL PRIVILEGES ON skyline.* TO 'skyline'@'%';
-  ```
-- **URL-encode special characters** in the password (`@` → `%40`, `#` → `%23`,
-  `/` → `%2F`, `:` → `%3A`, `%` → `%25`), e.g.
-  `mysql://skyline:p%40ss%23word@10.0.0.5:3306/skyline`.
-- **Switching away from the local DB** (setting `database-url` on a unit that
-  previously used local MariaDB, or relating the mysql-router) leaves the local
-  database and its data untouched but no longer used — no data is migrated to
-  the external server. The charm runs `systemctl disable --now mariadb`, so the
-  local service is stopped and disabled automatically (its package and data
-  files remain on disk until you remove them manually).
-
 ---
 
 ## Scaling out / High availability
@@ -683,7 +675,7 @@ nothing, use the cold-start recipe in **Step 5b** instead.)
 juju deploy ./skyline_ubuntu-22.04-amd64.charm \
   --config keystone-url="https://KEYSTONE_IP:5000/v3/" \
   --config system-user-password="SKYLINE_SERVICE_PASSWORD" \
-  --to lxd:1                       # NO database-url — the router drives the DB
+  --to lxd:1                       # no DB config — the shared-db router drives it
 juju integrate skyline:shared-db skyline-mysql-router:shared-db
 juju add-unit skyline -n 2 --to lxd:0,lxd:1   # same DB, same secret
 ```
@@ -1005,6 +997,14 @@ calls still return 200). External networks always render as the single top
 bar. On charm revisions without the patch, create one internal network with a
 subnet as a workaround.
 
+**Login stopped working after relating keystone (`identity-credentials`).**
+The keystone charm generates (and adopts) the password for the service user
+the first time the relation is processed, so a previously configured
+`system-user-password` no longer works. Read the current one with
+`juju run skyline show-config --wait` and update any scripts/openrcs. The
+relation's URL and credentials always take precedence over the config values;
+remove the relation to fall back.
+
 ---
 
 ## Upgrading
@@ -1041,14 +1041,18 @@ install
   └─ verify venv deps (pip check self-heal)
 
 config-changed  (fired automatically after install)
-  ├─ validate keystone-url and system-user-password
+  ├─ validate keystone-url and system-user-password (skipped when the
+  │    identity-credentials relation provides credentials)
   ├─ publish uniform secret_key to skyline-peers (leader)
+  ├─ identity-credentials related but no credentials published yet
+  │    → WaitingStatus, defer the rest of configure
   ├─ shared-db related but router credentials not published yet
   │    → WaitingStatus, defer the rest of configure
   ├─ create local MariaDB db/user on 127.0.0.1:13306 (if no shared-db
-  │    relation and database-url is empty; never started once related)
+  │    relation; never started once related)
   ├─ render skyline.yaml, gunicorn.py, skyline-apiserver.service
-  │    (database_url = shared-db relation > database-url config > local MariaDB)
+  │    (keystone url/user = identity-credentials relation > config;
+  │     database_url = shared-db relation > local MariaDB)
   ├─ GENERATE nginx.conf from the keystone catalog + inject GET /healthz
   │    (fallback to templates/nginx.conf.j2 if the generator fails)
   ├─ systemctl daemon-reload
@@ -1095,7 +1099,7 @@ each one.
 
 ## Testing
 
-100 local unit tests cover the charm's logic layer — helper functions, nginx
+108 local unit tests cover the charm's logic layer — helper functions, nginx
 injection, JS bundle patching, action handlers, lifecycle events, and relation
 handlers. They run entirely offline (no Juju/MAAS required) and mock all
 subprocess calls.

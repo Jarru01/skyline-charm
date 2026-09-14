@@ -10,12 +10,13 @@ description: |
   and installed directly — no Node.js, nvm, yarn or webpack build at deploy time.
 
   Components deployed:
-    - MariaDB (local, optional — skipped when database-url is supplied)
+    - MariaDB (local, optional — skipped when a shared-db relation provides the DB)
     - skyline-apiserver (Python ASGI app via gunicorn on 127.0.0.1:28000)
     - skyline-console  (pre-built Python wheel, served by nginx)
     - nginx            (public listener on listen-port, default 9999)
 
-  Required before deploy:
+  Required before deploy (unless the identity-credentials relation provides
+  Keystone credentials):
     - keystone-url          full Keystone v3 endpoint URL
     - system-user-password  password of the skyline OpenStack service user
     - files/skyline_console-*.whl must be present before charmcraft pack
@@ -30,8 +31,8 @@ bases:
         channel: "22.04"
 
 requires:
-  db:
-    interface: mysql
+  identity-credentials:
+    interface: keystone-credentials
     optional: true
   shared-db:
     interface: mysql-shared

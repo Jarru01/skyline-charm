@@ -319,6 +319,12 @@ class SkylineCharm(ops.CharmBase):
                                self._on_shared_db_changed)
         self.framework.observe(self.on["shared-db"].relation_broken,
                                self._on_shared_db_changed)
+        self.framework.observe(self.on["identity-credentials"].relation_joined,
+                               self._on_identity_credentials_changed)
+        self.framework.observe(self.on["identity-credentials"].relation_changed,
+                               self._on_identity_credentials_changed)
+        self.framework.observe(self.on["identity-credentials"].relation_broken,
+                               self._on_identity_credentials_changed)
         self.framework.observe(self.on["skyline-peers"].relation_changed,
                                self._on_peers_changed)
 
@@ -459,14 +465,12 @@ class SkylineCharm(ops.CharmBase):
         return False
 
     def _using_local_db(self) -> bool:
-        if self._shared_db_data():
-            return False
         if self._shared_db_related():
             # A mysql-router subordinate is attached (credentials may still be
             # in flight). Never fall back to a local MariaDB: it would race the
             # router for 127.0.0.1:3306 and wedge its bootstrap.
             return False
-        return not bool(self.config.get("database-url", "").strip())
+        return True
 
     def _db_password(self) -> str:
         if not self._stored.db_password:
@@ -533,8 +537,6 @@ class SkylineCharm(ops.CharmBase):
                 port=shared["port"],
                 db=quote(shared["database"], safe=""),
             )
-        if not self._using_local_db():
-            return self.config["database-url"].strip()
         # Local MariaDB is deliberately OFF the router's port range: it binds
         # 127.0.0.1:13306 (see _setup_local_mariadb), leaving 127.0.0.1:3306
         # to the co-located mysql-router subordinate. Hook timing can never
@@ -542,12 +544,127 @@ class SkylineCharm(ops.CharmBase):
         return f"mysql://skyline:{self._db_password()}@localhost:{LOCAL_MARIADB_PORT}/skyline"
 
     def _keystone_url(self) -> str:
+        creds = self._identity_credentials_data()
+        if creds:
+            return "{proto}://{host}:{port}/v3/".format(
+                proto=creds["protocol"],
+                host=creds["host"],
+                port=creds["port"],
+            )
         url = self.config.get("keystone-url", "").strip().rstrip("/")
         if not url.endswith("/v3"):
             url += "/v3"
         return url + "/"
 
+    def _identity_credentials_data(self):
+        """Keystone URL + service credentials from the keystone charm.
+
+        The ``identity-credentials`` relation asks the keystone charm to
+        create (or reuse) a service user and returns the public Keystone
+        endpoint plus the generated username/password/project/domain.
+        Returns None until a provider unit has published a complete set of
+        values (or if it reports an unsupported API version).
+        """
+        relations = self.model.relations.get("identity-credentials") or []
+        for relation in relations:
+            candidates = []
+            if relation.app is not None:
+                candidates.append(relation.data[relation.app])
+            candidates.extend(relation.data[unit] for unit in relation.units)
+            for data in candidates:
+                d = dict(data)
+                host = d.get("credentials_host")
+                username = d.get("credentials_username")
+                password = d.get("credentials_password")
+                port = d.get("credentials_port")
+                if not (host and username and password and port):
+                    continue
+                api_version = str(d.get("api_version") or "3").split(".")[0]
+                if api_version != "3":
+                    logger.warning(
+                        "identity-credentials: unsupported Keystone "
+                        "api_version %r; using config instead",
+                        d.get("api_version"),
+                    )
+                    continue
+                return {
+                    "host": host,
+                    "port": port,
+                    "protocol": d.get("credentials_protocol") or "http",
+                    "username": username,
+                    "password": password,
+                    "project": d.get("credentials_project") or "",
+                    "project_domain": (
+                        d.get("credentials_project_domain_name") or ""
+                    ),
+                    "user_domain": d.get("credentials_user_domain_name") or "",
+                    "region": d.get("region") or "",
+                }
+        return None
+
+    def _identity_credentials_related(self) -> bool:
+        """True while a keystone provider unit is attached to the relation."""
+        for rel in self.model.relations.get("identity-credentials") or []:
+            if rel.units:
+                return True
+        return False
+
+    def _publish_identity_request(self) -> None:
+        """Requirer half of the keystone-credentials contract.
+
+        Advertises the desired username/project/domain on the relation unit
+        databag; the keystone charm creates the user (if needed), grants its
+        admin role and replies with credentials_host/credentials_username/
+        credentials_password/... which ``_identity_credentials_data`` reads.
+        Idempotent; no-op when the relation is absent.
+        """
+        want = {
+            "username": self.config["identity-username"].strip() or "skyline",
+            "project": self.config["identity-project"].strip() or "admin",
+            "domain": (
+                self.config["identity-project-domain"].strip() or "admin_domain"
+            ),
+        }
+        for rel in self.model.relations.get("identity-credentials") or []:
+            unit_data = rel.data[self.unit]
+            if any(unit_data.get(k) != v for k, v in want.items()):
+                unit_data.update(want)
+                logger.info("Published identity-credentials request: %s", want)
+
+    def _effective_identity(self) -> dict:
+        """Identity values for the templates, relation > config precedence.
+
+        The keystone charm rewrites the existing user's password when the
+        relation is processed, so the relation MUST win over config whenever
+        its data is complete.
+        """
+        creds = self._identity_credentials_data() or {}
+        return {
+            "keystone_url": self._keystone_url(),
+            "system_user_name": (
+                creds.get("username") or self.config["system-user-name"]
+            ),
+            "system_user_password": (
+                creds.get("password") or self.config["system-user-password"]
+            ),
+            "system_user_domain": (
+                creds.get("user_domain") or self.config["system-user-domain"]
+            ),
+            "system_project": (
+                creds.get("project") or self.config["system-project"]
+            ),
+            "system_project_domain": (
+                creds.get("project_domain")
+                or self.config["system-project-domain"]
+            ),
+            "default_region": (
+                creds.get("region") or self.config["default-region"]
+            ),
+        }
+
     def _missing_required_config(self) -> str:
+        if self._identity_credentials_data() or self._identity_credentials_related():
+            return ""
         if not self.config.get("keystone-url", "").strip():
             return "Required config 'keystone-url' is not set"
         if not self.config.get("system-user-password", "").strip():
@@ -557,15 +674,16 @@ class SkylineCharm(ops.CharmBase):
     def _template_context(self) -> dict:
         cfg = self.config
         workers = cfg["gunicorn-workers"]
+        identity = self._effective_identity()
         return {
             "database_url":                   self._database_url(),
-            "keystone_url":                   self._keystone_url(),
-            "default_region":                 cfg["default-region"],
-            "system_user_name":               cfg["system-user-name"],
-            "system_user_password":           cfg["system-user-password"],
-            "system_user_domain":             cfg["system-user-domain"],
-            "system_project":                 cfg["system-project"],
-            "system_project_domain":          cfg["system-project-domain"],
+            "keystone_url":                   identity["keystone_url"],
+            "default_region":                 identity["default_region"],
+            "system_user_name":               identity["system_user_name"],
+            "system_user_password":           identity["system_user_password"],
+            "system_user_domain":             identity["system_user_domain"],
+            "system_project":                 identity["system_project"],
+            "system_project_domain":          identity["system_project_domain"],
             "interface_type":                 cfg["interface-type"],
             "sso_enabled":                    cfg["sso-enabled"],
             "sso_region":                     cfg["sso-region"],
@@ -1505,6 +1623,25 @@ class SkylineCharm(ops.CharmBase):
         self._patch_network_topology()
         self._patch_kubeconfig_endpoint()
         self._publish_shared_db_request()
+        self._publish_identity_request()
+
+        if self._identity_credentials_data() and (
+            self.config.get("keystone-url", "").strip()
+            or self.config.get("system-user-password", "").strip()
+        ):
+            logger.warning(
+                "identity-credentials relation provides Keystone credentials; "
+                "the keystone-url/system-user-password config values are ignored"
+            )
+
+        if self._identity_credentials_related() and not self._identity_credentials_data():
+            # Relation attached but the keystone charm has not published
+            # credentials yet. Wait instead of rendering stale config.
+            self.unit.status = ops.WaitingStatus(
+                "Waiting for Keystone credentials (identity-credentials)"
+            )
+            logger.info("identity-credentials attached without data; deferring configure")
+            return False
 
         if self._shared_db_related() and not self._shared_db_data():
             # Router attached but has not published credentials yet. Wait
@@ -1672,9 +1809,9 @@ class SkylineCharm(ops.CharmBase):
         """
         mysql-router (shared-db) data appeared or went away.
 
-        When a router provides database_url it overrides the config value and
-        switches the charm out of local-MariaDB mode; db_sync + templates are
-        re-run so the apiserver moves to the cluster.
+        When a router publishes database credentials the charm switches out of
+        local-MariaDB mode; db_sync + templates are re-run so the apiserver
+        moves to the cluster.
         """
         if not self._stored.installed:
             self.unit.status = ops.WaitingStatus("Waiting for install to complete")
@@ -1690,6 +1827,31 @@ class SkylineCharm(ops.CharmBase):
         except Exception as exc:
             logger.exception("shared-db relation handler failed")
             self.unit.status = ops.BlockedStatus(f"Database relation error: {exc}")
+
+    def _on_identity_credentials_changed(self, event: ops.RelationChangedEvent):
+        """
+        Keystone credentials (identity-credentials) appeared, changed or went
+        away.
+
+        When the relation publishes complete data it takes precedence over the
+        keystone-url/system-user-password config values: the keystone charm
+        owns the user and its (re)generated password. Removing the relation
+        falls back to the config values.
+        """
+        if not self._stored.installed:
+            self.unit.status = ops.WaitingStatus("Waiting for install to complete")
+            event.defer()
+            return
+        try:
+            self._publish_secret_key()
+            ok = self._configure()
+            if ok:
+                self.unit.status = ops.ActiveStatus(
+                    f"Skyline ready on :{self.config['listen-port']}"
+                )
+        except Exception as exc:
+            logger.exception("identity-credentials relation handler failed")
+            self.unit.status = ops.BlockedStatus(f"Keystone relation error: {exc}")
 
     def _on_peers_changed(self, event: ops.RelationChangedEvent):
         """
