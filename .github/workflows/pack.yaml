@@ -18,6 +18,7 @@ jobs:
       - name: Verify bundled artifacts
         run: |
           unzip -l skyline_ubuntu-22.04-amd64.charm | grep -E 'whl|tar.gz'
+          unzip -p skyline_ubuntu-22.04-amd64.charm metadata.yaml | grep identity-credentials
           sha256sum skyline_ubuntu-22.04-amd64.charm
       - name: Upload charm
         uses: actions/upload-artifact@v4
