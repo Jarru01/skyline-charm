@@ -329,7 +329,7 @@ Notes:
   `system-project*` and `default-region`. Remove the relation to fall back to
   the config values.
 - **Password:** generated and owned by the keystone charm; read it with
-  `juju run skyline show-config --wait` (or `juju show-unit skyline/0`).
+  `juju run skyline show-config` (or `juju show-unit skyline/0`).
 - **Existing users:** the first relation processing rewrites the existing
   user's password (one-time). Role grants are merged; the system-scope
   `Admin` grant from Step 4 is not touched and stays recommended for the
@@ -377,7 +377,7 @@ Barbican, etc.) *after* Skyline, their pages will return the SPA fallback until
 you regenerate the config:
 
 ```bash
-juju run skyline regenerate-nginx --wait
+juju run skyline regenerate-nginx
 ```
 
 Do this on every catalogue change — new services, removed endpoints, or
@@ -447,20 +447,20 @@ When the cloud publishes all three interfaces (the common case), switching
 `interface-type` is functionally transparent — only the upstream URLs change
 (e.g. admin Keystone `:35357` vs public `:5000`). After a change the
 config-changed hook re-renders `skyline.yaml` and regenerates nginx; force it
-manually with `juju run skyline regenerate-nginx --wait`.
+manually with `juju run skyline regenerate-nginx`.
 
 ---
 
 ## Actions
 
 ```bash
-juju run skyline db-sync --wait
-juju run skyline get-static-path --wait
-juju run skyline restart-services --wait
-juju run skyline show-config --wait
-juju run skyline regenerate-nginx --wait   # after keystone catalog changes
-juju run skyline patch-frontend --wait    # fix Create Cluster page on cinder-less deploys
-juju run skyline patch-kubeconfig --wait # inject kubeconfig endpoint + Download button
+juju run skyline db-sync
+juju run skyline get-static-path
+juju run skyline restart-services
+juju run skyline show-config
+juju run skyline regenerate-nginx   # after keystone catalog changes
+juju run skyline patch-frontend    # fix Create Cluster page on cinder-less deploys
+juju run skyline patch-kubeconfig # inject kubeconfig endpoint + Download button
 ```
 
 (`skyline` targets the whole app — works whatever the unit id is. `juju run
@@ -654,8 +654,8 @@ outside the charm against the cluster, or login breaks again with 3098.
 
 ```bash
 juju status skyline skyline-mysql-router mysql-innodb-cluster --relations
-juju run skyline show-config --wait     # database_url: mysql://skyline:...@127.0.0.1:3306/skyline
-juju run skyline db-sync --wait         # migrate, including the PK fix
+juju run skyline show-config     # database_url: mysql://skyline:...@127.0.0.1:3306/skyline
+juju run skyline db-sync         # migrate, including the PK fix
 juju ssh skyline/0 -- 'systemctl is-active mariadb'   # expect: inactive
 juju ssh skyline/0 -- 'ss -ltn | grep 330'            # expect: router on 3306-3309
 ```
@@ -700,7 +700,7 @@ Two prerequisites are handled by the charm but worth verifying after scaling:
 1. **One shared database** — every unit must use the same mysql-router
    `shared-db` relation (see above). Never scale with per-unit local MariaDB.
 2. **One uniform `secret_key`** — the leader publishes it over
-   `skyline-peers`; check each unit with `juju run skyline show-config --wait`.
+   `skyline-peers`; check each unit with `juju run skyline show-config`.
 
 ## Access layer (Phase 2): HAProxy + Keepalived VIP
 
@@ -933,7 +933,7 @@ Fix the roles, then regenerate nginx and reload the login page:
 ```bash
 openstack role add --project admin --user skyline admin
 openstack role add --user skyline --user-domain admin_domain --system all Admin
-juju run skyline regenerate-nginx --wait
+juju run skyline regenerate-nginx
 ```
 
 Which upstream URLs nginx actually uses (admin vs public vs internal):
@@ -970,13 +970,13 @@ crashes when Cinder is not in the service catalog. The charm auto-patches this
 at config time (V3 patch — fixes both the TypeError and the missing
 `enableCinder` guard). If you see it on a pre-patch deployment:
 ```bash
-juju run skyline patch-frontend --wait
+juju run skyline patch-frontend
 # then hard-refresh the browser (Ctrl+Shift+R)
 ```
 If the error persists after patching, it may be a browser cache issue. The
 charm uses `must-revalidate` cache headers, but older deployments may have
 `immutable` headers. Clear the browser cache manually (Ctrl+Shift+Delete)
-and hard-refresh, or run `juju run skyline regenerate-nginx --wait` to
+and hard-refresh, or run `juju run skyline regenerate-nginx` to
 update the nginx config with the correct cache headers.
 
 **Network → Topology is empty (console: `e.subnetNodes[d] is undefined`).**
@@ -1001,7 +1001,7 @@ subnet as a workaround.
 The keystone charm generates (and adopts) the password for the service user
 the first time the relation is processed, so a previously configured
 `system-user-password` no longer works. Read the current one with
-`juju run skyline show-config --wait` and update any scripts/openrcs. The
+`juju run skyline show-config` and update any scripts/openrcs. The
 relation's URL and credentials always take precedence over the config values;
 remove the relation to fall back.
 
@@ -1094,7 +1094,7 @@ propagated to all units:
 juju config skyline secret-key=NEW_VALUE   # rotate — invalidates all sessions
 ```
 
-Verify uniformity across units with `juju run skyline show-config --wait` on
+Verify uniformity across units with `juju run skyline show-config` on
 each one.
 
 ## Testing
