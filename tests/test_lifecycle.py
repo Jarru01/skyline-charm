@@ -50,7 +50,7 @@ class TestOnConfigChanged:
         with patch.object(harness.charm, "_configure", return_value=True):
             harness.charm.on.config_changed.emit()
             assert harness.charm.unit.status.name == "active"
-            assert "Skyline ready" in harness.charm.unit.status.message
+            assert "Unit is ready" in harness.charm.unit.status.message
 
     def test_handles_exception(self, harness):
         harness.begin()
@@ -110,7 +110,7 @@ class TestOnUpgradeCharm:
              patch.object(harness.charm, "_configure", return_value=True):
             harness.charm.on.upgrade_charm.emit()
             assert harness.charm.unit.status.name == "active"
-            assert "Skyline ready" in harness.charm.unit.status.message
+            assert "Unit is ready" in harness.charm.unit.status.message
 
     def test_blocks_on_upgrade_failure(self, harness):
         harness.begin()

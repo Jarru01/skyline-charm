@@ -67,8 +67,21 @@ http {
 
     # ── Virtual server ──────────────────────────────────────────────────
     server {
+{% if tls_enabled %}
+        # TLS is provided by the `certificates` relation (vault PKI).
+        listen {{ tls_port }} ssl default_server;
+        listen [::]:{{ tls_port }} ssl default_server;
+
+        ssl_certificate {{ tls_cert_path }};
+        ssl_certificate_key {{ tls_key_path }};
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_prefer_server_ciphers off;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+{% else %}
         listen {{ listen_port }} default_server;
         listen [::]:{{ listen_port }} default_server;
+{% endif %}
 
         server_name _;
 
@@ -154,4 +167,14 @@ http {
             try_files $uri =404;
         }
     }
+{% if tls_enabled and tls_redirect %}
+
+    # Plain HTTP (listen-port) is kept as a permanent redirect to HTTPS.
+    server {
+        listen {{ listen_port }} default_server;
+        listen [::]:{{ listen_port }} default_server;
+        server_name _;
+        return 301 https://$host{% if tls_port != 443 %}:{{ tls_port }}{% endif %}$request_uri;
+    }
+{% endif %}
 }

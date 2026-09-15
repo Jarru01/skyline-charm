@@ -35,3 +35,10 @@ patch-kubeconfig:
     skyline-console JS bundles so every cluster row has a working
     "Download Kubeconfig" button. Idempotent — safe to run multiple times.
     Restarts skyline-apiserver to load the new endpoint.
+
+check-tls:
+  description: |
+    Verify outbound TLS: runs the CA validation probe against every HTTPS
+    endpoint in the Keystone catalog and prints the result (ok, number of
+    endpoints checked, and any per-endpoint failures). Read-only; useful to
+    confirm that cafile verification is enabled and healthy.

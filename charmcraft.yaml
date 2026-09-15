@@ -37,6 +37,9 @@ requires:
   shared-db:
     interface: mysql-shared
     optional: true
+  certificates:
+    interface: tls-certificates
+    optional: true
 
 provides:
   website:

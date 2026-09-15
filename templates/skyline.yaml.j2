@@ -5,7 +5,7 @@
 default:
   access_token_expire: 3600
   access_token_renew: 1800
-  cafile: ''
+  cafile: '{{ cafile }}'
   cors_allow_origins: []
   database_url: '{{ database_url }}'
   debug: {{ debug | lower }}

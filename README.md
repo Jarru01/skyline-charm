@@ -10,7 +10,7 @@ container:
 | skyline-apiserver | Python ASGI app, gunicorn on `127.0.0.1:28000` (loopback) |
 | skyline-console | Pre-built Python wheel, static assets served by nginx |
 | MariaDB | Local instance, binds `127.0.0.1:13306` (optional — skipped when a `mysql-router` `shared-db` relation provides the DB) |
-| nginx | Public listener, default port `9999` |
+| nginx | Public listener: `9999` plain, plus `443` HTTPS when the `certificates` relation provides a certificate (9999 then 301-redirects) |
 
 Everything the unit needs is **bundled inside the charm** (`files/`):
 
@@ -41,6 +41,13 @@ design.
 - Keystone discovery via the `identity-credentials` relation: the keystone
   charm creates the service user and supplies the public endpoint + generated
   password, taking precedence over `keystone-url` / `system-user-password`
+- **TLS on the units (`certificates` relation):** the vault PKI issues a
+  per-unit certificate (SAN = unit hostname + ingress IP); nginx serves HTTPS
+  on `tls-port` (default `443`) and keeps `listen-port` (default `9999`) as a
+  301 redirect. Outbound TLS to OpenStack is verified with the relation CA
+  (`cafile`) after a probe confirms every HTTPS endpoint in the catalog
+  validates; plain-HTTP endpoints (e.g. heat) are never affected. Inspect with
+  the `check-tls` action — see [TLS on the units](#tls-on-the-units)
 - Uniform session `secret_key` shared across units over `skyline-peers`
 - Prometheus monitoring — set `prometheus-endpoint` and the console Monitor
   pages are populated. Each unit queries the same Prometheus API
@@ -63,14 +70,18 @@ design.
   discovers/removes backends automatically — no static server lists anywhere
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
-  `get-static-path`, `patch-frontend`, `patch-kubeconfig`
-- **Unit tests:** 108 tests covering helpers, nginx injection, JS patching,
-  actions, lifecycle events, and relations (run with `py -3 -m pytest tests/`)
+  `get-static-path`, `patch-frontend`, `patch-kubeconfig`, `check-tls`
+- **Unit tests:** 142 tests covering helpers, nginx injection, JS patching,
+  actions, lifecycle events, relations and TLS (run with `py -3 -m pytest tests/`)
 
 **Remaining / planned**
 
-- **TLS termination** at the access layer (VIP serves HTTP `:80` by default;
-  optional how-to: [TLS termination at the VIP](#tls-termination-at-the-vip))
+- VIP TLS termination uses operator-provided certificates (how-to:
+  [TLS termination at the VIP](#tls-termination-at-the-vip)); the units
+  themselves already terminate TLS via the `certificates` relation.
+- nginx → OpenStack-service upstream verification (`proxy_ssl_verify`) is not
+  enabled yet; the apiserver and all catalog queries are already verified via
+  `cafile` (see [TLS on the units](#tls-on-the-units)).
 
 ---
 
@@ -105,7 +116,7 @@ skyline-charm/
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
 │   │   offline_proof.sh, check_db.sh
 │   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
-├── tests/                             # unit tests (offline, 108 tests)
+├── tests/                             # unit tests (offline, 142 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
 │   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config tests
@@ -118,8 +129,10 @@ skyline-charm/
 
 ### Routing & nginx
 
-- nginx listens on `listen-port` (default `9999`) — the **only** public entry
-  point.
+- nginx listens on `listen-port` (default `9999`) and — when the
+  `certificates` relation provides a certificate — also on `tls-port`
+  (default `443`) with TLS; plain requests on `listen-port` then get a 301
+  redirect to `https://<host>/`.
 - Static console assets are served by nginx directly from the installed
   `skyline_console` wheel.
 - The Skyline API: `/api/openstack/skyline/*` → stripped → apiserver `/api/v1/*`.
@@ -153,6 +166,43 @@ this instead of `/` — static console files are served even when the API
 backend is dead. The database is intentionally *not* part of the probe: it is
 cluster-global, so an outage affects every backend identically and per-unit
 removal would not help.
+
+### TLS on the units
+
+Relate the charm to the vault PKI and the unit serves HTTPS natively:
+
+```bash
+juju integrate skyline:certificates vault:certificates
+```
+
+- The vault charm issues **one certificate per unit** (CN = unit hostname,
+  SAN = hostname + ingress IP) and publishes the root CA/chain.
+- The charm writes the material to `/etc/skyline/certs/` (`server.key` mode
+  `0600`), installs the CA into the unit trust store, injects an `ssl`
+  listener on `tls-port` (default `443`) into the generated (and fallback)
+  nginx config, and turns `listen-port` (default `9999`) into a 301 redirect —
+  disable with `tls-redirect=false`.
+- `ssl_enabled` in `skyline.yaml` is forced to `true` while TLS is active (it
+  only affects the WebSSO redirect URL scheme).
+- **Outbound verification:** the same CA is used as `cafile` to verify every
+  OpenStack service Skyline calls — but only when the configure-time probe
+  confirms **all** HTTPS endpoints in the catalog validate against it. If any
+  endpoint fails, verification stays off (the pre-TLS behaviour) and the
+  failures are logged. Run `juju run skyline/<unit> check-tls` for a report.
+  Plain-HTTP endpoints (e.g. heat) are never affected — `cafile` only applies
+  to `https://` URLs.
+- Certificates are renewed by the provider re-publishing over the relation;
+  the charm rewrites the files and reloads nginx only when the material
+  actually changes.
+- Removing the relation reverts the unit to plain HTTP on `listen-port`
+  (port `443` is closed again, `cafile` becomes empty).
+- **Browser trust:** the unit certificate is signed by the Vault Root CA,
+  which browsers do not trust by default. Import the CA (e.g.
+  `/etc/skyline/certs/vault-ca.crt`) into the browser/OS, or terminate with a
+  publicly-trusted certificate at the access layer
+  ([TLS termination at the VIP](#tls-termination-at-the-vip)).
+- **Load balancers:** the backend is now HTTPS — configure the haproxy
+  backend with `ssl check-ssl verify none` (see the access-layer section).
 
 ### Offline installation
 
@@ -270,6 +320,7 @@ juju integrate skyline-mysql-router:certificates vault:certificates
 juju integrate skyline:shared-db                 skyline-mysql-router:shared-db
 
 juju integrate skyline:identity-credentials keystone:identity-credentials
+juju integrate skyline:certificates           vault:certificates
 ```
 
 The keystone charm creates (or reuses) the user named by `identity-username`
@@ -291,6 +342,11 @@ Notes:
   from Step 4 is unrelated and stays recommended for full admin panels.
 - **Wrong project/domain creates a second user** — keep the defaults or set
   the options to match your cloud.
+- **TLS:** the `skyline:certificates → vault:certificates` relation gives the
+  units HTTPS on `443` (with `9999` redirecting) and enables outbound
+  verification when the CA validates every HTTPS catalog endpoint — see
+  [TLS on the units](#tls-on-the-units). Optional: skip the relation to keep
+  serving plain HTTP on `9999` only.
 - The relation only exists on Juju-managed OpenStack clouds; use **5b**
   elsewhere.
 - **`integrate` vs `relate`:** both work on Juju 3.x — `relate` is kept as a
@@ -317,6 +373,8 @@ Notes:
     bootstrapping against the cluster
   - `Waiting for Keystone credentials (identity-credentials)` — the keystone
     charm has not published credentials yet
+  - `Waiting for TLS certificate (certificates)` — the vault charm has not
+    issued the unit certificate yet (or vault is sealed)
   - `Configuring local MariaDB` — briefly on units *added* to a router-backed
     app, until their own co-located router joins (see
     [Database backends](#database-backends))
@@ -371,7 +429,7 @@ maintenance: Software installed; awaiting config
 maintenance: Rendering configuration
 maintenance: Generating nginx config from keystone catalog
 maintenance: Running database migration (db_sync)
-active:      Skyline ready on :9999
+active:      Unit is ready
 ```
 
 ## Step 7 — Access the dashboard
@@ -380,7 +438,9 @@ active:      Skyline ready on :9999
 juju status skyline   # note the unit IP address
 ```
 
-Open `http://<UNIT_IP>:9999` in a browser.
+Open `https://<UNIT_IP>/` when the `certificates` relation is in use, or
+`http://<UNIT_IP>:9999` otherwise (with TLS active, `9999` redirects to
+`443`).
 
 ---
 
@@ -414,9 +474,12 @@ service-url updates.
 | `identity-project` | `admin` | Project for the `identity-credentials` user |
 | `identity-project-domain` | `admin_domain` | Domain for the `identity-credentials` user/project |
 | `interface-type` | `public` | Endpoint interface used by the APIServer: `public`, `internal`, or `admin` (see [Endpoint interface resolution](#endpoint-interface-resolution-interface-type)) |
-| `listen-port` | `9999` | nginx listener port |
+| `listen-port` | `9999` | Plain nginx listener port (301-redirects to TLS when active) |
+| `tls-port` | `443` | HTTPS listener port used while the `certificates` relation provides a certificate |
+| `tls-redirect` | `true` | 301-redirect plain `listen-port` traffic to HTTPS when TLS is active |
+| `cafile` | `""` | CA bundle path for outbound TLS verification; empty = use the relation CA when it validates every HTTPS catalog endpoint |
 | `debug` | `false` | Enable debug logging |
-| `ssl-enabled` | `false` | Enable SSL flag in skyline.yaml |
+| `ssl-enabled` | `false` | Sets Skyline's `ssl_enabled` flag — **WebSSO redirect-URL scheme only**; forced `true` while TLS is active |
 | `secret-key` | `""` | Session key (auto-generated if empty) |
 | `prometheus-endpoint` | `""` | Prometheus URL — **scheme required**, e.g. `http://10.0.0.3:9090`; a bare `host:port` breaks the Monitor pages |
 | `prometheus-enable-basic-auth` | `false` | Basic auth when scraping Prometheus |
@@ -476,6 +539,7 @@ juju run skyline/0 show-config
 juju run skyline/0 regenerate-nginx   # after keystone catalog changes
 juju run skyline/0 patch-frontend    # fix Create Cluster page on cinder-less deploys
 juju run skyline/0 patch-kubeconfig # inject kubeconfig endpoint + Download button
+juju run skyline/0 check-tls        # verify outbound TLS against all HTTPS endpoints
 ```
 
 > **Actions are unit-scoped on Juju 3.6.** `juju run skyline <action>` fails
@@ -689,7 +753,8 @@ juju ssh skyline/0 -- 'systemctl is-active mariadb'   # expect: inactive
 juju ssh skyline/0 -- 'ss -ltn | grep 330'            # expect: router on 3306-3309
 ```
 
-Then log into `http://<UNIT_IP>:9999`.
+Then log into `https://<UNIT_IP>/` (or `http://<UNIT_IP>:9999` when the TLS
+`certificates` relation is not in use).
 
 ---
 
@@ -786,13 +851,28 @@ curl -s -u "$CREDS" 'http://127.0.0.1:10000/;csv' | grep '^skyline_be' | cut -d,
 Rendered topology (per unit): `:80` tcp → peer haproxy units on `:81`
 (active/backup), `:81` http → `skyline_be` = all skyline units with
 `httpchk GET /healthz` (`inter 10s rise 2 fall 3`). Stats on `:10000`
-(localhost-only by default).
+(localhost-only by default). With TLS on the units the `:81` backend speaks
+`ssl` to `<unit>:443` and the health check uses `check-ssl` (`verify none`).
 
 ### TLS termination at the VIP
 
-TLS is terminated at HAProxy; the skyline units keep serving plain HTTP on
-`9999` and the `website` relation is unchanged — no skyline charm change is
-required.
+There are two layers; both were validated on the test cloud.
+
+**1. Units terminate TLS (recommended — `certificates` relation).** The units
+serve HTTPS on `443` and publish `443` over the `website` relation, so the
+haproxy backends must speak TLS:
+
+```bash
+juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 80, "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s"], "server_options": "check check-ssl ssl verify none inter 10s rise 2 fall 3"}]'
+```
+
+`ssl` makes ordinary traffic TLS, `check-ssl` performs the health check over
+TLS, and `verify none` is appropriate on the trusted management network (the
+units' Vault CA is not installed on the haproxy units; add `ca-file` +
+`verify required` if you want full validation there as well).
+
+**2. Terminate at the VIP with an operator-provided certificate (optional).**
+Use this when clients must see a publicly-trusted certificate:
 
 1. Obtain a certificate for a name that resolves to the VIP (preferred), or
    one with the VIP in its **IP SAN** (browsers reject CN-only-IP certs).
@@ -806,33 +886,41 @@ required.
    # juju config haproxy ssl_cert=SELFSIGNED
    ```
 
-3. Move the skyline service to `443` and attach the default certificate.
-   Backends stay `<skyline-unit>:9999` plain HTTP over the internal network:
+3. Bind the service on `443` with the default certificate. Keep the backend
+   options **in sync with what the units serve** — `ssl check-ssl verify none`
+   when the units have TLS, or plain `check ...` when they do not:
 
    ```bash
-   juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 443, "crts": ["DEFAULT"], "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s", "http-request add-header X-Forwarded-Proto https if { ssl_fc }"], "server_options": "check inter 10s rise 2 fall 3"}]'
+   juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 443, "crts": ["DEFAULT"], "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s", "http-request add-header X-Forwarded-Proto https if { ssl_fc }"], "server_options": "check check-ssl ssl verify none inter 10s rise 2 fall 3"}]'
    ```
 
 4. Open TCP/443 wherever TCP/80 is allowed. `keepalived`/the VIP need no
    change — `443` binds on every haproxy unit and fails over like `80`.
 
-Verify:
+Verify (both scenarios):
 
 ```bash
 curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/healthz   # 200
 ```
 
-Caveats:
+Notes:
 
+- With this legacy haproxy charm (rev 147), a service entry that sets `crts`
+  also TLS-ifies the peer tier, and the public listener is the next port up
+  (e.g. `service_port: 8443` → public `:8444 ssl`). Match the port you dial.
 - The legacy haproxy charm keeps the certificate as static config; renewal
   means re-running the `juju config` commands above (or integrating the
   certbot charm for automated issuance).
-- If SSO is enabled, also `juju config skyline ssl-enabled=true` so Skyline
-  builds `https` origin URLs.
+- `ssl-enabled` does **not** need to be set manually: the charm forces it to
+  `true` while TLS is active (it only affects the WebSSO origin URL scheme).
+- Flipping the units to TLS moves the published backend port from `9999` to
+  `443`; update the haproxy `server_options` in the same maintenance window to
+  avoid a brief health-check flap.
 
 ### Failover test results (T1–T5)
 
-Measured with a client loop hitting `http://10.11.1.200/healthz` every ~0.27 s.
+Measured with a client loop hitting `http://10.11.1.200/healthz` every ~0.27 s
+(plain-HTTP path; the failover mechanism is unchanged with TLS on the units).
 
 | Test | Scenario | Result |
 |---|---|---|
@@ -918,7 +1006,8 @@ return HTTP 500.
 
 **502 Bad Gateway (nginx up, gunicorn down).**
 ```bash
-curl -I http://127.0.0.1:9999/healthz   # 502 = gunicorn dead, 200 = alive
+curl -I http://127.0.0.1:9999/healthz    # 502 = gunicorn dead, 200 = alive
+curl -Ik https://127.0.0.1/healthz --cacert /etc/skyline/certs/vault-ca.crt  # with TLS
 ss -tlnp | grep 28000
 journalctl -u skyline-apiserver --no-pager -n 50
 ```
@@ -1034,6 +1123,42 @@ the first time the relation is processed, so a previously configured
 relation's URL and credentials always take precedence over the config values;
 remove the relation to fall back.
 
+**Units stuck at `Waiting for TLS certificate (certificates)`.**
+The vault charm has not issued the unit certificate. Check vault health and
+whether it is sealed:
+
+```bash
+juju status vault
+juju ssh vault/0 -- "sudo bash -lc 'vault status | grep -E \"Sealed|HA Mode\"'"
+```
+
+If vault is sealed, unseal it with the deployment's unseal keys (`vault
+operator unseal <key>` on the vault unit, three keys by default), then
+`juju resolve vault/0`. Once the CA/certificate is published the skyline
+units reconfigure by themselves.
+
+**HTTPS works but the browser shows a certificate warning.**
+The unit certificate is signed by the Vault Root CA, which browsers do not
+trust by default. Import `/etc/skyline/certs/vault-ca.crt` (path visible in
+`juju run skyline/<unit> show-config`) into the browser/OS, or terminate with
+a publicly-trusted certificate at the VIP
+([TLS termination at the VIP](#tls-termination-at-the-vip)). Firefox showing
+`MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT` means you are hitting a self-signed VIP
+test certificate (`ssl_cert=SELFSIGNED`), not the Vault-issued unit one.
+
+**`cafile` stays empty / outbound verification is off.**
+The charm only enables `cafile` when the relation CA validates **every**
+HTTPS endpoint in the catalog; otherwise it logs the failures and keeps
+verification off (plain-HTTP services like heat are unaffected either way).
+Ask the charm for the exact result:
+
+```bash
+juju run skyline/0 check-tls
+```
+
+Fix the reported endpoints (wrong CA, missing IP SANs) or set an explicit
+`cafile` bundle that covers them.
+
 **Removing Skyline (or scaling in) can wedge `mysql-innodb-cluster` / `vault`.**
 Every skyline unit carries a co-located `mysql-router` subordinate, so removing
 skyline units or the app also departs a router from `mysql-innodb-cluster`
@@ -1078,7 +1203,8 @@ juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
 
 `upgrade-charm` re-installs the apiserver wheel and console wheel from the
 bundle, re-extracts the tarball for `db_sync`, regenerates the nginx config and
-restarts services.
+restarts services. TLS material from the `certificates` relation is kept and
+rewritten only when the provider delivers new material (renewals, CA rotation).
 
 ---
 
@@ -1105,20 +1231,31 @@ config-changed  (fired automatically after install)
   │    → WaitingStatus, defer the rest of configure
   ├─ shared-db related but router credentials not published yet
   │    → WaitingStatus, defer the rest of configure
+  ├─ certificates related but no certificate issued yet
+  │    → WaitingStatus, defer the rest of configure
+  ├─ install cert/key/CA (checksum-guarded) + CA into the system store
   ├─ create local MariaDB db/user on 127.0.0.1:13306 (if no shared-db
   │    relation; never started once related)
   ├─ render skyline.yaml, gunicorn.py, skyline-apiserver.service
   │    (keystone url/user = identity-credentials relation > config;
-  │     database_url = shared-db relation > local MariaDB)
+  │     database_url = shared-db relation > local MariaDB;
+  │     cafile = explicit config > relation CA when the HTTPS probe passes;
+  │     ssl_enabled = true while TLS is active)
   ├─ GENERATE nginx.conf from the keystone catalog + inject GET /healthz
   │    (fallback to templates/nginx.conf.j2 if the generator fails)
+  ├─ when TLS is active: inject the 443 ssl listener and the 9999 301 redirect
   ├─ systemctl daemon-reload
   ├─ make db_sync  (Alembic)
   │    ├─ cluster path, non-leader unit: wait for the leader's schema first
   │    └─ leader then adds InnoDB Cluster primary keys on revoked_token /
   │         settings (idempotent ALTER; Group Replication requirement, err 3098)
   └─ enable + restart skyline-apiserver; nginx reload-or-restart;
-     open listen-port in juju (Ports column)
+     open listen-port in juju (and tls-port when TLS is active)
+
+certificates relation-joined/changed/broken
+  └─ publish the per-unit certificate request (hostname/IP SANs); on delivery
+     re-render with TLS and reload nginx only when the material changed; on
+     break revert to plain HTTP on listen-port and close tls-port
 
 shared-db relation-created
   └─ stop/disable local MariaDB immediately (router owns 127.0.0.1:3306)
@@ -1132,8 +1269,8 @@ skyline-peers relation-changed (new unit / rotated secret_key)
 website relation-joined/changed  (+ re-publish after every successful
 │                                   configure, e.g. listen-port change)
   └─ publish {hostname, private-address, port} = this unit's ingress
-       address + listen-port → HAProxy (reverseproxy) picks it up as a
-       backend server with health checks
+       address + listen-port (or tls-port when TLS is active) → HAProxy
+       (reverseproxy) picks it up as a backend server with health checks
 
 start
   └─ confirm skyline-apiserver is active → set ActiveStatus
@@ -1156,10 +1293,10 @@ on each one (e.g. `skyline/0`, `skyline/1`, ...).
 
 ## Testing
 
-108 local unit tests cover the charm's logic layer — helper functions, nginx
-injection, JS bundle patching, action handlers, lifecycle events, and relation
-handlers. They run entirely offline (no Juju/MAAS required) and mock all
-subprocess calls.
+142 local unit tests cover the charm's logic layer — helper functions, nginx
+injection, JS bundle patching, action handlers, lifecycle events, relations
+and TLS handling. They run entirely offline (no Juju/MAAS required) and mock
+all subprocess calls.
 
 ```bash
 py -3 -m pip install "ops>=2.9.0" jinja2 pytest   # one-time

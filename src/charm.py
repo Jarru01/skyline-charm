@@ -35,15 +35,19 @@ config change once keystone is reachable.
 
 """
 
+import json
+import hashlib
 import logging
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import textwrap
 import tarfile
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -64,6 +68,13 @@ SKYLINE_CONF_DIR   = Path("/etc/skyline")
 SKYLINE_LOG_DIR    = Path("/var/log/skyline")
 SKYLINE_POLICY_DIR = SKYLINE_CONF_DIR / "policy"
 
+# TLS material delivered by the `certificates` relation (vault PKI).
+CERTS_DIR      = SKYLINE_CONF_DIR / "certs"
+TLS_CERT_PATH  = CERTS_DIR / "server.crt"
+TLS_KEY_PATH   = CERTS_DIR / "server.key"
+TLS_CA_PATH    = CERTS_DIR / "vault-ca.crt"
+SYSTEM_CA_PATH = Path("/usr/local/share/ca-certificates/skyline-vault-ca.crt")
+
 SYSTEMD_UNIT_PATH  = Path("/etc/systemd/system/skyline-apiserver.service")
 NGINX_CONF_PATH    = Path("/etc/nginx/nginx.conf")
 GUNICORN_CONF_PATH = SKYLINE_CONF_DIR / "gunicorn.py"
@@ -74,6 +85,70 @@ GENERATED_NGINX_PATH = SKYLINE_CONF_DIR / "nginx.conf.generated"
 # range so a co-located router can always bind 3306 regardless of hook order.
 LOCAL_MARIADB_PORT = 13306
 MARIADB_CNF_PATH   = Path("/etc/mysql/mariadb.conf.d/60-skyline.cnf")
+
+
+# ── TLS verification probe ──────────────────────────────────────────────────
+# Run with the venv python before enabling `cafile` in skyline.yaml: it
+# authenticates against Keystone with the configured system credentials and
+# then TLS-verifies every unique HTTPS endpoint in the returned catalog.
+# Verification is only enabled when one CA bundle validates ALL endpoints;
+# plain-HTTP endpoints (e.g. heat) are skipped by design and never affected.
+_TLS_PROBE_SRC = '''\
+import json
+import os
+import sys
+
+import requests
+
+result = {"ok": False, "checked": 0, "failures": []}
+keystone = os.environ["PROBE_KEYSTONE_URL"].rstrip("/")
+cafile = os.environ["PROBE_CAFILE"]
+body = {
+    "auth": {
+        "identity": {
+            "methods": ["password"],
+            "password": {
+                "user": {
+                    "name": os.environ["PROBE_USERNAME"],
+                    "domain": {"name": os.environ["PROBE_USER_DOMAIN"]},
+                    "password": os.environ["PROBE_PASSWORD"],
+                }
+            },
+        },
+        "scope": {
+            "project": {
+                "name": os.environ["PROBE_PROJECT"],
+                "domain": {"name": os.environ["PROBE_PROJECT_DOMAIN"]},
+            }
+        },
+    }
+}
+try:
+    resp = requests.post(
+        keystone + "/auth/tokens", json=body, verify=cafile, timeout=15
+    )
+    resp.raise_for_status()
+    token = resp.json().get("token", {})
+except Exception as exc:
+    result["failures"].append("keystone {}: {}".format(keystone, exc))
+    print(json.dumps(result))
+    sys.exit(0)
+
+urls = set()
+for service in token.get("catalog", []):
+    for endpoint in service.get("endpoints", []):
+        url = endpoint.get("url", "")
+        if url.startswith("https://") and "$" not in url:
+            urls.add(url)
+for url in sorted(urls):
+    result["checked"] += 1
+    try:
+        requests.get(url, verify=cafile, timeout=10)
+    except Exception as exc:
+        result["failures"].append("{}: {}".format(url, exc))
+result["ok"] = not result["failures"]
+print(json.dumps(result))
+'''
 
 
 # ── Kubeconfig endpoint source ─────────────────────────────────────────────
@@ -307,7 +382,17 @@ class SkylineCharm(ops.CharmBase):
             db_password="",
             static_path="",
             opened_port=0,
+            opened_tls_port=0,
+            cert_uuid="",
+            cert_fingerprint="",
+            ca_fingerprint="",
+            tls_probe_failures="",
         )
+        # Per-hook memo of the TLS probe result (never persisted, so a changed
+        # catalog can not keep a stale success; configured-time only, so web
+        # requests are never affected).
+        self._cafile_probe = None
+        self._last_probe_checked = 0
         self.framework.observe(self.on.install,        self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.start,          self._on_start)
@@ -325,6 +410,12 @@ class SkylineCharm(ops.CharmBase):
                                self._on_identity_credentials_changed)
         self.framework.observe(self.on["identity-credentials"].relation_broken,
                                self._on_identity_credentials_changed)
+        self.framework.observe(self.on["certificates"].relation_joined,
+                               self._on_certificates_changed)
+        self.framework.observe(self.on["certificates"].relation_changed,
+                               self._on_certificates_changed)
+        self.framework.observe(self.on["certificates"].relation_broken,
+                               self._on_certificates_changed)
         self.framework.observe(self.on["skyline-peers"].relation_changed,
                                self._on_peers_changed)
 
@@ -340,6 +431,7 @@ class SkylineCharm(ops.CharmBase):
         self.framework.observe(self.on.regenerate_nginx_action, self._on_action_regenerate_nginx)
         self.framework.observe(self.on.patch_frontend_action, self._on_action_patch_frontend)
         self.framework.observe(self.on.patch_kubeconfig_action, self._on_action_patch_kubeconfig)
+        self.framework.observe(self.on.check_tls_action,       self._on_action_check_tls)
 
     # ── Low-level helpers ───────────────────────────────────────────────────
 
@@ -662,6 +754,183 @@ class SkylineCharm(ops.CharmBase):
             ),
         }
 
+    # ── TLS certificates (vault PKI via the `certificates` relation) ───────
+    #
+    # Protocol (charmhelpers `tls-certificates` interface, provider = vault):
+    # the requirer publishes `unit_name`, `common_name`, `sans` (JSON list)
+    # and `certificate_name` in its own unit databag; the provider writes the
+    # signed `server.cert`/`server.key` for that unit, keyed by the unit name,
+    # plus the root `ca` (and optional `chain`) into ITS unit databag.
+
+    def _certificates_related(self) -> bool:
+        """True while at least one provider unit is attached."""
+        for rel in self.model.relations.get("certificates") or []:
+            if rel.units:
+                return True
+        return False
+
+    def _certificate_unit_key(self) -> str:
+        return self.unit.name.replace("/", "_")
+
+    def _certificates_data(self):
+        """Signed cert/key/CA from the provider, or None when incomplete."""
+        rels = self.model.relations.get("certificates") or []
+        key = self._certificate_unit_key()
+        for rel in rels:
+            if not rel.units:
+                continue
+            ca = chain = cert = private_key = ""
+            for unit in rel.units:
+                data = rel.data[unit]
+                ca = ca or (data.get("ca") or "")
+                chain = chain or (data.get("chain") or "")
+                cert = cert or (data.get(f"{key}.server.cert") or "")
+                private_key = private_key or (data.get(f"{key}.server.key") or "")
+            if cert and private_key:
+                return {
+                    "certificate": cert,
+                    "private_key": private_key,
+                    "ca": ca,
+                    "chain": chain,
+                }
+        return None
+
+    def _publish_certificate_request(self) -> None:
+        """Requirer half of the tls-certificates contract (idempotent)."""
+        rels = self.model.relations.get("certificates") or []
+        if not rels:
+            return
+        hostname = socket.getfqdn() or self.unit.name.replace("/", "-")
+        if not self._stored.cert_uuid:
+            self._stored.cert_uuid = str(uuid.uuid4())
+        for rel in rels:
+            try:
+                ingress = str(
+                    self.model.get_binding(rel).network.ingress_address
+                )
+            except Exception:
+                ingress = ""
+            sans = sorted({s for s in (hostname, ingress) if s})
+            want = {
+                "unit_name": self._certificate_unit_key(),
+                "common_name": hostname,
+                "certificate_name": self._stored.cert_uuid,
+                "sans": json.dumps(sans),
+            }
+            unit_data = rel.data[self.unit]
+            changed = {k: v for k, v in want.items() if unit_data.get(k) != v}
+            if changed:
+                unit_data.update(changed)
+                logger.info("Published TLS certificate request: %s", changed)
+
+    def _install_certificates(self, certs: dict) -> bool:
+        """Write cert/key/CA to disk; True when the material changed."""
+        CERTS_DIR.mkdir(parents=True, exist_ok=True)
+        bundle = "\n".join(
+            p.strip()
+            for p in (certs.get("ca"), certs.get("chain"))
+            if p and p.strip()
+        )
+        fingerprint = hashlib.sha256(
+            (
+                certs["certificate"]
+                + certs["private_key"]
+                + bundle
+            ).encode()
+        ).hexdigest()
+        if self._stored.cert_fingerprint == fingerprint:
+            return False
+        TLS_CERT_PATH.write_text(
+            certs["certificate"].strip() + "\n", encoding="utf-8"
+        )
+        TLS_KEY_PATH.write_text(
+            certs["private_key"].strip() + "\n", encoding="utf-8"
+        )
+        os.chmod(TLS_KEY_PATH, 0o600)
+        if bundle:
+            TLS_CA_PATH.write_text(bundle + "\n", encoding="utf-8")
+            ca_fingerprint = hashlib.sha256(bundle.encode()).hexdigest()
+            if self._stored.ca_fingerprint != ca_fingerprint:
+                SYSTEM_CA_PATH.write_text(bundle + "\n", encoding="utf-8")
+                self._run(["update-ca-certificates"], check=False)
+                self._stored.ca_fingerprint = ca_fingerprint
+        else:
+            logger.warning(
+                "certificates relation delivered no CA bundle; outbound "
+                "verification stays disabled"
+            )
+        self._stored.cert_fingerprint = fingerprint
+        logger.info("Installed TLS certificate material for %s", self.unit.name)
+        return True
+
+    def _probe_cafile(self, cafile_path: Path, identity: dict,
+                      force: bool = False):
+        """Verify every HTTPS endpoint in the catalog against the CA bundle.
+
+        Returns (ok, failures). The result is memoized for the current hook
+        run only (never persisted), so a changed catalog can never keep a
+        stale success. The probe only runs at configure time / from the
+        check-tls action and is never on a user request path.
+        """
+        if self._cafile_probe is not None and not force:
+            return self._cafile_probe
+        env = os.environ.copy()
+        env.update({
+            "PROBE_KEYSTONE_URL": identity["keystone_url"],
+            "PROBE_USERNAME": identity["system_user_name"],
+            "PROBE_PASSWORD": identity["system_user_password"],
+            "PROBE_USER_DOMAIN": identity["system_user_domain"],
+            "PROBE_PROJECT": identity["system_project"],
+            "PROBE_PROJECT_DOMAIN": identity["system_project_domain"],
+            "PROBE_CAFILE": str(cafile_path),
+        })
+        checked = 0
+        try:
+            result = self._run(
+                [str(VENV_PY), "-c", _TLS_PROBE_SRC],
+                env=env, capture=True, check=False, timeout=120,
+            )
+            data = json.loads((result.stdout or "").strip() or "{}")
+        except Exception as exc:
+            logger.warning("TLS probe could not run: %s", exc)
+            ok, failures = False, [f"probe error: {exc}"]
+        else:
+            ok = bool(data.get("ok"))
+            failures = data.get("failures") or []
+            checked = int(data.get("checked") or 0)
+        self._cafile_probe = (ok, failures)
+        self._last_probe_checked = checked
+        self._stored.tls_probe_failures = json.dumps(failures)
+        if ok:
+            logger.info(
+                "TLS probe: all %s https endpoint(s) verified", checked
+            )
+        else:
+            logger.warning(
+                "TLS probe failed; keeping cafile empty: %s", failures
+            )
+        return ok, failures
+
+    def _effective_cafile(self, identity: dict, certs) -> str:
+        """CA bundle path for outbound verification, or "" to disable it."""
+        explicit = self.config.get("cafile", "").strip()
+        if explicit:
+            if Path(explicit).exists():
+                return explicit
+            logger.warning(
+                "configured cafile %s does not exist; verification stays off",
+                explicit,
+            )
+            return ""
+        if (certs and TLS_CA_PATH.exists()
+                and TLS_CA_PATH.stat().st_size > 0):
+            ok, _ = self._probe_cafile(TLS_CA_PATH, identity)
+            return str(TLS_CA_PATH) if ok else ""
+        return ""
+
+    def _tls_enabled(self) -> bool:
+        return self._certificates_data() is not None
+
     def _missing_required_config(self) -> str:
         if self._identity_credentials_data() or self._identity_credentials_related():
             return ""
@@ -675,6 +944,9 @@ class SkylineCharm(ops.CharmBase):
         cfg = self.config
         workers = cfg["gunicorn-workers"]
         identity = self._effective_identity()
+        certs = self._certificates_data()
+        tls_enabled = certs is not None
+        cafile = self._effective_cafile(identity, certs)
         return {
             "database_url":                   self._database_url(),
             "keystone_url":                   identity["keystone_url"],
@@ -690,7 +962,13 @@ class SkylineCharm(ops.CharmBase):
             "enforce_new_defaults":           cfg["enforce-new-defaults"],
             "reclaim_instance_interval":      cfg["reclaim-instance-interval"],
             "debug":                          cfg["debug"],
-            "ssl_enabled":                    cfg["ssl-enabled"],
+            "ssl_enabled":                    bool(cfg["ssl-enabled"]) or tls_enabled,
+            "cafile":                         cafile,
+            "tls_enabled":                    tls_enabled,
+            "tls_port":                       cfg["tls-port"],
+            "tls_redirect":                   cfg["tls-redirect"],
+            "tls_cert_path":                  str(TLS_CERT_PATH),
+            "tls_key_path":                   str(TLS_KEY_PATH),
             "secret_key":                     self._secret_key(),
             "prometheus_endpoint":            cfg.get("prometheus-endpoint", "").strip(),
             "prometheus_enable_basic_auth":   cfg["prometheus-enable-basic-auth"],
@@ -1513,6 +1791,7 @@ class SkylineCharm(ops.CharmBase):
             )
             content = self._inject_health_endpoint(content)
             content = self._inject_static_cache_control(content)
+            content = self._inject_tls(content)
             NGINX_CONF_PATH.write_text(content, encoding="utf-8")
             logger.info(
                 "nginx.conf generated from keystone catalog -> %s", NGINX_CONF_PATH
@@ -1613,6 +1892,76 @@ class SkylineCharm(ops.CharmBase):
         logger.info("Injected static-asset cache-control into nginx config")
         return content
 
+    def _inject_tls(self, content: str) -> str:
+        """Serve HTTPS with the vault-issued certificate.
+
+        Rewrites the generated plain HTTP listener into an `ssl` listener on
+        `tls-port`, prints the cert/key paths, and (when `tls-redirect` is on)
+        appends a plain server on `listen-port` that 301-redirects to HTTPS.
+        Pattern-based and idempotent; no-op when no certificate is available.
+        """
+        if self._certificates_data() is None:
+            return content
+        marker = "# skyline-charm: tls listener"
+        if marker in content:
+            return content
+        tls_port = int(self.config["tls-port"])
+        match = re.search(
+            r"\n(\s*)listen 0\.0\.0\.0:\d+(?: default_server)?;", content
+        )
+        if not match:
+            logger.warning(
+                "TLS listener not injected: no listen anchor in generated config"
+            )
+            return content
+        indent = match.group(1)
+        block = (
+            f"\n{indent}{marker}\n"
+            f"{indent}listen 0.0.0.0:{tls_port} ssl default_server;\n"
+            f"{indent}listen [::]:{tls_port} ssl default_server;\n"
+            f"\n{indent}ssl_certificate {TLS_CERT_PATH};\n"
+            f"{indent}ssl_certificate_key {TLS_KEY_PATH};\n"
+            f"{indent}ssl_protocols TLSv1.2 TLSv1.3;\n"
+            f"{indent}ssl_prefer_server_ciphers off;\n"
+            f"{indent}ssl_session_cache shared:SSL:10m;\n"
+            f"{indent}ssl_session_timeout 10m;"
+        )
+        content = content.replace(match.group(0), block, 1)
+
+        if self.config["tls-redirect"]:
+            listen_port = int(self.config["listen-port"])
+            if listen_port == tls_port:
+                logger.warning(
+                    "tls-port equals listen-port (%s); skipping the HTTP "
+                    "redirect to avoid an nginx listener conflict",
+                    tls_port,
+                )
+            else:
+                target = "https://$host"
+                if tls_port != 443:
+                    target += f":{tls_port}"
+                redirect = (
+                    "\n\n    server {"
+                    f"\n        listen 0.0.0.0:{listen_port};"
+                    f"\n        listen [::]:{listen_port};"
+                    "\n        server_name _;"
+                    f"\n        return 301 {target}$request_uri;"
+                    "\n    }\n"
+                )
+                idx = content.rstrip().rfind("\n}")
+                if idx != -1:
+                    content = content[:idx] + redirect + content[idx:]
+                else:
+                    logger.warning(
+                        "TLS redirect not injected: no closing http block found"
+                    )
+
+        logger.info(
+            "Injected TLS listener (port %s, redirect=%s)",
+            tls_port, self.config["tls-redirect"],
+        )
+        return content
+
     def _configure(self):
         error = self._missing_required_config()
         if error:
@@ -1624,6 +1973,7 @@ class SkylineCharm(ops.CharmBase):
         self._patch_kubeconfig_endpoint()
         self._publish_shared_db_request()
         self._publish_identity_request()
+        self._publish_certificate_request()
 
         if self._identity_credentials_data() and (
             self.config.get("keystone-url", "").strip()
@@ -1651,6 +2001,19 @@ class SkylineCharm(ops.CharmBase):
             )
             logger.info("shared-db attached without credentials; deferring configure")
             return False
+
+        if self._certificates_related() and self._certificates_data() is None:
+            # Provider attached but has not issued a certificate yet. Wait so
+            # the unit never comes up half-configured (HTTP) and then flips.
+            self.unit.status = ops.WaitingStatus(
+                "Waiting for TLS certificate (certificates)"
+            )
+            logger.info("certificates attached without cert; deferring configure")
+            return False
+
+        certs = self._certificates_data()
+        if certs:
+            self._install_certificates(certs)
 
         self.unit.status = ops.MaintenanceStatus("Rendering configuration")
         self._ensure_directories()
@@ -1724,6 +2087,21 @@ class SkylineCharm(ops.CharmBase):
             self._stored.opened_port = port
             logger.info("Opened tcp/%s in juju", port)
 
+        tls_port = int(self.config["tls-port"]) if self._tls_enabled() else 0
+        previous_tls = int(self._stored.opened_tls_port or 0)
+        if previous_tls and previous_tls != tls_port:
+            try:
+                self.unit.close_port("tcp", previous_tls)
+            except Exception as exc:
+                logger.warning(
+                    "could not close old tls port tcp/%s: %s", previous_tls, exc
+                )
+            self._stored.opened_tls_port = 0
+        if tls_port and tls_port != previous_tls:
+            self.unit.open_port("tcp", tls_port)
+            self._stored.opened_tls_port = tls_port
+            logger.info("Opened tcp/%s in juju", tls_port)
+
     def _on_shared_db_created(self, event: ops.RelationCreatedEvent):
         """
         A mysql-router subordinate was just attached. Free 127.0.0.1:3306
@@ -1762,7 +2140,7 @@ class SkylineCharm(ops.CharmBase):
             ok = self._configure()
             if ok:
                 self.unit.status = ops.ActiveStatus(
-                    f"Skyline ready on :{self.config['listen-port']}"
+                    "Unit is ready"
                 )
         except Exception as exc:
             logger.exception("config-changed failed")
@@ -1779,7 +2157,7 @@ class SkylineCharm(ops.CharmBase):
             )
             if result.stdout.strip() == "active":
                 self.unit.status = ops.ActiveStatus(
-                    f"Skyline ready on :{self.config['listen-port']}"
+                    "Unit is ready"
                 )
             else:
                 self.unit.status = ops.BlockedStatus("skyline-apiserver is not active")
@@ -1799,7 +2177,7 @@ class SkylineCharm(ops.CharmBase):
             ok = self._configure()
             if ok:
                 self.unit.status = ops.ActiveStatus(
-                    f"Skyline ready on :{self.config['listen-port']}"
+                    "Unit is ready"
                 )
         except Exception as exc:
             logger.exception("upgrade-charm failed")
@@ -1822,7 +2200,7 @@ class SkylineCharm(ops.CharmBase):
             ok = self._configure()
             if ok:
                 self.unit.status = ops.ActiveStatus(
-                    f"Skyline ready on :{self.config['listen-port']}"
+                    "Unit is ready"
                 )
         except Exception as exc:
             logger.exception("shared-db relation handler failed")
@@ -1847,11 +2225,34 @@ class SkylineCharm(ops.CharmBase):
             ok = self._configure()
             if ok:
                 self.unit.status = ops.ActiveStatus(
-                    f"Skyline ready on :{self.config['listen-port']}"
+                    "Unit is ready"
                 )
         except Exception as exc:
             logger.exception("identity-credentials relation handler failed")
             self.unit.status = ops.BlockedStatus(f"Keystone relation error: {exc}")
+
+    def _on_certificates_changed(self, event: ops.RelationEvent):
+        """
+        TLS certificate material appeared, changed or went away.
+
+        With complete material the unit serves HTTPS (tls-port) and the
+        relation CA is used for outbound verification when it validates every
+        HTTPS endpoint; without it the charm stays on plain HTTP 9999.
+        """
+        if not self._stored.installed:
+            self.unit.status = ops.WaitingStatus("Waiting for install to complete")
+            event.defer()
+            return
+        try:
+            self._publish_secret_key()
+            ok = self._configure()
+            if ok:
+                self.unit.status = ops.ActiveStatus(
+                    "Unit is ready"
+                )
+        except Exception as exc:
+            logger.exception("certificates relation handler failed")
+            self.unit.status = ops.BlockedStatus(f"Certificates error: {exc}")
 
     def _on_peers_changed(self, event: ops.RelationChangedEvent):
         """
@@ -1866,7 +2267,7 @@ class SkylineCharm(ops.CharmBase):
             ok = self._configure()
             if ok:
                 self.unit.status = ops.ActiveStatus(
-                    f"Skyline ready on :{self.config['listen-port']}"
+                    "Unit is ready"
                 )
         except Exception as exc:
             logger.exception("peer relation handler failed")
@@ -1883,7 +2284,10 @@ class SkylineCharm(ops.CharmBase):
     def _publish_website(self, relation: ops.Relation):
         binding = self.model.get_binding(relation)
         ingress = str(binding.network.ingress_address) if binding else ""
-        port = str(self.config["listen-port"])
+        if self._tls_enabled():
+            port = str(self.config["tls-port"])
+        else:
+            port = str(self.config["listen-port"])
         relation.data[self.unit].update({
             "hostname": ingress,
             "private-address": ingress,
@@ -1897,7 +2301,7 @@ class SkylineCharm(ops.CharmBase):
         try:
             self._run_db_sync()
             self.unit.status = ops.ActiveStatus(
-                f"Skyline ready on :{self.config['listen-port']}"
+                "Unit is ready"
             )
             event.set_results({"result": "db_sync completed successfully"})
         except Exception as exc:
@@ -1934,7 +2338,7 @@ class SkylineCharm(ops.CharmBase):
             self._run(["nginx", "-t"])
             self._run(["systemctl", "reload-or-restart", "nginx"])
             self.unit.status = ops.ActiveStatus(
-                f"Skyline ready on :{self.config['listen-port']}"
+                "Unit is ready"
             )
             event.set_results({
                 "source": "keystone-catalog" if generated else "static-fallback",
@@ -2002,11 +2406,45 @@ class SkylineCharm(ops.CharmBase):
             # New router file must be loaded by the apiserver
             self._restart_services(nginx=False)
             self.unit.status = ops.ActiveStatus(
-                f"Skyline ready on :{self.config['listen-port']}"
+                "Unit is ready"
             )
             event.set_results({"result": "kubeconfig button patched"})
         except Exception as exc:
             event.fail(f"patch-kubeconfig failed: {exc}")
+
+    def _on_action_check_tls(self, event: ops.ActionEvent):
+        """Read-only: verify outbound TLS against every HTTPS catalog endpoint."""
+        try:
+            identity = self._effective_identity()
+            explicit = self.config.get("cafile", "").strip()
+            if explicit:
+                cafile = explicit
+            elif TLS_CA_PATH.exists() and TLS_CA_PATH.stat().st_size > 0:
+                cafile = str(TLS_CA_PATH)
+            else:
+                cafile = ""
+            if not cafile or not Path(cafile).exists():
+                event.set_results({
+                    "ok": False,
+                    "checked": 0,
+                    "cafile": "(none)",
+                    "failures": (
+                        "no CA available: relate certificates to vault or "
+                        "set the cafile option"
+                    ),
+                })
+                return
+            ok, failures = self._probe_cafile(
+                Path(cafile), identity, force=True
+            )
+            event.set_results({
+                "ok": ok,
+                "checked": self._last_probe_checked,
+                "cafile": cafile,
+                "failures": "\n".join(failures),
+            })
+        except Exception as exc:
+            event.fail(f"check-tls failed: {exc}")
 
 
 if __name__ == "__main__":

@@ -108,9 +108,38 @@ options:
     type: boolean
     default: false
     description: |
-      Set ssl_enabled in skyline.yaml.
-      NOTE: This controls skyline's internal SSL flag only. To serve nginx
-      over HTTPS, a separate cert management layer is required.
+      Set ssl_enabled in skyline.yaml. NOTE: this only controls the URL
+      scheme Skyline builds for the WebSSO redirect (and any SSO URL); it
+      does not serve or verify TLS. It is forced to true automatically while
+      the `certificates` relation provides TLS. To serve nginx over HTTPS
+      (and to verify outbound TLS), use the `certificates` relation.
+
+  tls-port:
+    type: int
+    default: 443
+    description: |
+      HTTPS port nginx listens on while the `certificates` relation provides
+      a certificate. The plain listener (`listen-port`, default 9999) is kept
+      and redirects to this port unless `tls-redirect` is disabled.
+
+  tls-redirect:
+    type: boolean
+    default: true
+    description: |
+      With TLS active, redirect plain HTTP (`listen-port`) to HTTPS
+      (`tls-port`) with a 301. Disable to keep serving the dashboard over
+      plain HTTP as well.
+
+  cafile:
+    type: string
+    default: ""
+    description: |
+      Path to a CA bundle used to verify outbound TLS to OpenStack services.
+      When empty (default), the CA delivered by the `certificates` relation is
+      used automatically — but only if it validates every HTTPS endpoint in
+      the Keystone catalog; otherwise verification stays off (the pre-TLS
+      behaviour) and the failures are logged. Plain-HTTP endpoints (e.g.
+      heat) are never affected by TLS verification.
 
   # ── Skyline application ───────────────────────────────────────────────
   debug:
