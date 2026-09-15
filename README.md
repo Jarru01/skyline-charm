@@ -860,7 +860,8 @@ There are two layers; both were validated on the test cloud.
 
 **1. Units terminate TLS (recommended — `certificates` relation).** The units
 serve HTTPS on `443` and publish `443` over the `website` relation, so the
-haproxy backends must speak TLS:
+haproxy backends must speak TLS (clients still connect to the VIP over plain
+HTTP in this mode — use scenario 2 for HTTPS at the VIP as well):
 
 ```bash
 juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 80, "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s"], "server_options": "check check-ssl ssl verify none inter 10s rise 2 fall 3"}]'
@@ -872,7 +873,7 @@ units' Vault CA is not installed on the haproxy units; add `ca-file` +
 `verify required` if you want full validation there as well).
 
 **2. Terminate at the VIP with an operator-provided certificate (optional).**
-Use this when clients must see a publicly-trusted certificate:
+Use this when clients must reach the dashboard over HTTPS:
 
 1. Obtain a certificate for a name that resolves to the VIP (preferred), or
    one with the VIP in its **IP SAN** (browsers reject CN-only-IP certs).
@@ -886,13 +887,18 @@ Use this when clients must see a publicly-trusted certificate:
    # juju config haproxy ssl_cert=SELFSIGNED
    ```
 
-3. Bind the service on `443` with the default certificate. Keep the backend
-   options **in sync with what the units serve** — `ssl check-ssl verify none`
-   when the units have TLS, or plain `check ...` when they do not:
+3. Bind the service so the **TLS listener lands on `443`**. With this legacy
+   charm (rev 147) the `ssl` frontend is created at `service_port + 1`, so use
+   `442` for HTTPS on `443` (and `server_options` must match what the units
+   serve: `ssl check-ssl verify none` when they have TLS, plain `check ...`
+   when they do not):
 
    ```bash
-   juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 443, "crts": ["DEFAULT"], "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s", "http-request add-header X-Forwarded-Proto https if { ssl_fc }"], "server_options": "check check-ssl ssl verify none inter 10s rise 2 fall 3"}]'
+   juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 442, "crts": ["DEFAULT"], "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s", "http-request add-header X-Forwarded-Proto https if { ssl_fc }"], "server_options": "check check-ssl ssl verify none inter 10s rise 2 fall 3"}]'
    ```
+
+   A plain TCP listener on `80` remains and forwards to each peer's TLS port;
+   plain HTTP on it does not work — always use `https://` in this mode.
 
 4. Open TCP/443 wherever TCP/80 is allowed. `keepalived`/the VIP need no
    change — `443` binds on every haproxy unit and fails over like `80`.
@@ -906,8 +912,9 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/healthz   # 200
 Notes:
 
 - With this legacy haproxy charm (rev 147), a service entry that sets `crts`
-  also TLS-ifies the peer tier, and the public listener is the next port up
-  (e.g. `service_port: 8443` → public `:8444 ssl`). Match the port you dial.
+  creates the `ssl` frontend at `service_port + 1` (validated: `442` → `:443
+  ssl`, `8443` → `:8444 ssl`). The published backend port follows whatever the
+  units report over the `website` relation.
 - The legacy haproxy charm keeps the certificate as static config; renewal
   means re-running the `juju config` commands above (or integrating the
   certbot charm for automated issuance).
