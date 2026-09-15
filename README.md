@@ -303,9 +303,11 @@ Notes:
   defaults to `ubuntu@24.04`; without the pin, on a 22.04 model the
   `shared-db` relation fails with *"subordinate must support principal
   application's base"* and skyline never gets a database (login shows no
-  region). If you already deployed the router and hit this, remove it
-  (`juju remove-application skyline-mysql-router --force`), redeploy with the
-  `--base` pin, and re-add the three `integrate` commands above.
+  region). If you already deployed the router and hit this, remove it with a
+  plain `juju remove-application skyline-mysql-router` (no `--force`/`--no-wait`
+  — an abrupt teardown can wedge `mysql-innodb-cluster`/`vault`, see
+  [Troubleshooting](#troubleshooting)), redeploy with the `--base` pin, and
+  re-add the three `integrate` commands above.
 - Expected transient statuses during bring-up:
   - `blocked: Required config 'keystone-url' is not set` — only if the first
     `config-changed` runs before the identity relation is added (e.g. you
