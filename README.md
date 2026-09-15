@@ -64,10 +64,11 @@ design.
 - **LB health endpoint:** `GET /healthz` reflects *this unit's* apiserver
   liveness (200 up / 502 down), injected into both the generated and the
   fallback nginx configs
-- **Website relation:** every unit publishes its ingress address +
-  `listen-port` on the `website` endpoint (`interface: http`, declared in
-  `charmcraft.yaml`). HAProxy consumes this via its `reverseproxy` side and
-  discovers/removes backends automatically — no static server lists anywhere
+- **Website relation:** every unit publishes its ingress address + `listen-port`
+  (or `tls-port` when TLS is active) on the `website` endpoint
+  (`interface: http`, declared in `charmcraft.yaml`). HAProxy consumes this via
+  its `reverseproxy` side and discovers/removes backends automatically — no
+  static server lists anywhere
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`, `patch-frontend`, `patch-kubeconfig`, `check-tls`
@@ -119,7 +120,7 @@ skyline-charm/
 ├── tests/                             # unit tests (offline, 142 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
-│   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config tests
+│   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config/tls tests
 └── skyline_ubuntu-22.04-amd64.charm   # built artifact (git-ignored)
 ```
 
@@ -724,8 +725,8 @@ Expected integrations once healthy (`juju status --relations`):
 > its co-located router subordinate joins (observed ~4 min in a cold scale-out
 > test), then stops it and switches to the cluster. Port collisions are
 > impossible by design: the local instance binds `127.0.0.1:13306`, never
-> 3306. The charm also opens `listen-port` in Juju, so it appears in the
-> `juju status` Ports column.
+> 3306. The charm also opens `listen-port` (and `tls-port` when TLS is active)
+> in Juju, so both appear in the `juju status` Ports column.
 
 **InnoDB Cluster primary-key note (error 3098)**
 
@@ -824,6 +825,9 @@ juju integrate skyline:website haproxy:reverseproxy
 # 4) Listener + health-check policy, set via charm config.
 #    NOTE: the value must be valid YAML; quote every scalar containing
 #    braces/spaces (an unquoted '{i}' breaks yaml.safe_load in the hook).
+#    The example below is the plain-HTTP setup; when the skyline units serve
+#    TLS (the certificates relation), use the TLS-enabled variants from
+#    "TLS termination at the VIP" instead — the backends publish port 443.
 juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.0.0", "service_port": 80, "service_options": ["mode http", "balance leastconn", "option httpchk GET /healthz", "http-check expect status 200", "timeout client 30s"], "server_options": "check inter 10s rise 2 fall 3"}]'
 ```
 
@@ -839,8 +843,9 @@ juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.
 Verify:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://10.11.1.200/healthz   # 200
-curl -s -o /dev/null -w '%{http_code}\n' http://10.11.1.200/          # 200
+curl -s  -o /dev/null -w '%{http_code}\n' http://10.11.1.200/healthz   # 200 (plain mode)
+curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/healthz  # 200 (TLS at the VIP)
+curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/         # 200 (TLS at the VIP)
 
 # per-unit backend status (stats are localhost-only by default):
 juju ssh haproxy/0
@@ -852,7 +857,8 @@ Rendered topology (per unit): `:80` tcp → peer haproxy units on `:81`
 (active/backup), `:81` http → `skyline_be` = all skyline units with
 `httpchk GET /healthz` (`inter 10s rise 2 fall 3`). Stats on `:10000`
 (localhost-only by default). With TLS on the units the `:81` backend speaks
-`ssl` to `<unit>:443` and the health check uses `check-ssl` (`verify none`).
+`ssl` to `<unit>:443` and the health check uses `check-ssl` (`verify none`);
+in TLS-at-the-VIP mode the TLS frontend binds `:443` directly.
 
 ### TLS termination at the VIP
 
