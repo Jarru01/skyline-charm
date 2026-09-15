@@ -348,6 +348,162 @@ class TestCertificatesHandler:
             assert harness_installed.charm.unit.status.message == "Unit is ready"
 
 
+GENERATED_NGINX_UPSTREAMS = (
+    "http {\n"
+    "    server {\n"
+    "        listen 0.0.0.0:9999 default_server;\n"
+    "        location /api/openstack/regionone/nova/ {\n"
+    "            proxy_pass https://nova.example.com:8774/;\n"
+    "            proxy_ssl_protocols TLSv1.2 TLSv1.3;\n"
+    "            proxy_ssl_server_name on;\n"
+    "        }\n"
+    "        location /api/openstack/regionone/glance/ {\n"
+    "            proxy_pass https://glance.example.com:9292/;\n"
+    "            proxy_ssl_protocols TLSv1.2 TLSv1.3;\n"
+    "            proxy_ssl_server_name on;\n"
+    "        }\n"
+    "        location /api/openstack/regionone/heat/ {\n"
+    "            proxy_pass http://heat.example.com:8004/;\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+)
+
+GENERATED_NGINX_UPSTREAMS_IP = (
+    "http {\n"
+    "    server {\n"
+    "        listen 0.0.0.0:9999 default_server;\n"
+    "        location /api/openstack/regionone/nova/ {\n"
+    "            proxy_pass https://10.0.0.5:8774/;\n"
+    "            proxy_ssl_protocols TLSv1.2 TLSv1.3;\n"
+    "            proxy_ssl_server_name on;\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+)
+
+
+def _fake_probe_and_openssl(cmd, *args, **kwargs):
+    """Serve the Python cafile probe and the openssl SAN discovery calls."""
+    if "python3" in str(cmd[0]):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"ok": True, "checked": 4, "failures": []})
+        )
+    if "s_client" in cmd:
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=(
+                "-----BEGIN CERTIFICATE-----\nMIIB\n"
+                "-----END CERTIFICATE-----\n"
+            ),
+        )
+    if "x509" in cmd:
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=(
+                "X509v3 Subject Alternative Name:\n"
+                "    DNS:nova.example.com, IP Address:10.0.0.5\n"
+            ),
+        )
+    return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+
+class TestUpstreamTlsVerify:
+    def test_noop_without_certificate(self, harness_installed):
+        out = harness_installed.charm._inject_upstream_tls_verify(
+            GENERATED_NGINX_UPSTREAMS
+        )
+        assert out == GENERATED_NGINX_UPSTREAMS
+
+    def test_noop_without_verified_ca(self, harness_installed, cert_paths):
+        harness_installed.charm._install_certificates(_certs_data())
+        harness_installed.charm._certificates_data = lambda: _certs_data()
+        # default mocked _run returns empty output -> probe fails -> no cafile
+        out = harness_installed.charm._inject_upstream_tls_verify(
+            GENERATED_NGINX_UPSTREAMS
+        )
+        assert out == GENERATED_NGINX_UPSTREAMS
+
+    def test_injects_for_https_upstreams_only(self, harness_installed, cert_paths):
+        harness_installed.charm._install_certificates(_certs_data())
+        harness_installed.charm._certificates_data = lambda: _certs_data()
+        harness_installed.charm._run = _fake_probe_and_openssl
+        out = harness_installed.charm._inject_upstream_tls_verify(
+            GENERATED_NGINX_UPSTREAMS
+        )
+        assert out.count("proxy_ssl_verify on;") == 2
+        assert out.count("proxy_ssl_verify_depth 2;") == 2
+        ca_path = cert_paths / "vault-ca.crt"
+        assert out.count(f"proxy_ssl_trusted_certificate {ca_path};") == 2
+        # hostname upstreams need no proxy_ssl_name override
+        assert "proxy_ssl_name" not in out
+        # the plain-HTTP heat location must stay untouched
+        heat_block = out.split("regionone/heat/")[1]
+        assert "proxy_ssl_verify" not in heat_block
+
+    def test_ip_upstream_gets_dns_san_name(self, harness_installed, cert_paths):
+        harness_installed.charm._install_certificates(_certs_data())
+        harness_installed.charm._certificates_data = lambda: _certs_data()
+        harness_installed.charm._run = _fake_probe_and_openssl
+        out = harness_installed.charm._inject_upstream_tls_verify(
+            GENERATED_NGINX_UPSTREAMS_IP
+        )
+        assert "proxy_ssl_name nova.example.com;" in out
+        assert "proxy_ssl_verify on;" in out
+
+    def test_ip_upstream_without_dns_san_is_skipped(
+        self, harness_installed, cert_paths
+    ):
+        harness_installed.charm._install_certificates(_certs_data())
+        harness_installed.charm._certificates_data = lambda: _certs_data()
+
+        def fake_run(cmd, *args, **kwargs):
+            if "python3" in str(cmd[0]):
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout=json.dumps(
+                        {"ok": True, "checked": 4, "failures": []}
+                    ),
+                )
+            if "s_client" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout="-----BEGIN CERTIFICATE-----\nMIIB\n"
+                           "-----END CERTIFICATE-----\n",
+                )
+            if "x509" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout="X509v3 Subject Alternative Name:\n"
+                           "    IP Address:10.0.0.5\n",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+        harness_installed.charm._run = fake_run
+        out = harness_installed.charm._inject_upstream_tls_verify(
+            GENERATED_NGINX_UPSTREAMS_IP
+        )
+        assert out == GENERATED_NGINX_UPSTREAMS_IP
+
+    def test_idempotent(self, harness_installed, cert_paths):
+        harness_installed.charm._install_certificates(_certs_data())
+        harness_installed.charm._certificates_data = lambda: _certs_data()
+        harness_installed.charm._run = _fake_probe_and_openssl
+        once = harness_installed.charm._inject_upstream_tls_verify(
+            GENERATED_NGINX_UPSTREAMS
+        )
+        assert harness_installed.charm._inject_upstream_tls_verify(once) == once
+
+    def test_no_anchor_returns_unchanged(self, harness_installed, cert_paths):
+        harness_installed.charm._install_certificates(_certs_data())
+        harness_installed.charm._certificates_data = lambda: _certs_data()
+        harness_installed.charm._run = _fake_probe_and_openssl
+        content = "http {\n    server {\n        listen 9999;\n    }\n}\n"
+        assert harness_installed.charm._inject_upstream_tls_verify(
+            content
+        ) == content
+
+
 class TestCheckTlsAction:
     def test_no_ca_available(self, harness_installed, cert_paths):
         out = harness_installed.run_action("check-tls")

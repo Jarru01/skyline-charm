@@ -37,6 +37,7 @@ config change once keystone is reachable.
 
 import json
 import hashlib
+import ipaddress
 import logging
 import os
 import re
@@ -367,6 +368,14 @@ def get_cluster_kubeconfig(cluster_id: str, request: Request):
 
     return PlainTextResponse(kubeconfig, media_type="text/yaml")
 '''
+
+
+def _is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
 
 
 class SkylineCharm(ops.CharmBase):
@@ -1792,6 +1801,7 @@ class SkylineCharm(ops.CharmBase):
             content = self._inject_health_endpoint(content)
             content = self._inject_static_cache_control(content)
             content = self._inject_tls(content)
+            content = self._inject_upstream_tls_verify(content)
             NGINX_CONF_PATH.write_text(content, encoding="utf-8")
             logger.info(
                 "nginx.conf generated from keystone catalog -> %s", NGINX_CONF_PATH
@@ -1961,6 +1971,128 @@ class SkylineCharm(ops.CharmBase):
             tls_port, self.config["tls-redirect"],
         )
         return content
+
+    def _upstream_dns_name(self, host: str, port: str, cache: dict) -> str:
+        """Discover a DNS SAN in the certificate served by host:port.
+
+        nginx (1.18 on Ubuntu 22.04) verifies upstream certificates against
+        DNS names only — it cannot match IP SANs — so an IP-literal
+        `proxy_pass` needs `proxy_ssl_name` set to a name that IS in the
+        certificate. Returns "" when no DNS SAN is available.
+        """
+        key = f"{host}:{port}"
+        if key in cache:
+            return cache[key]
+        dns = ""
+        try:
+            s_client = self._run(
+                ["openssl", "s_client", "-connect", key],
+                input_data="\n", capture=True, check=False, timeout=15,
+            )
+            match = re.search(
+                r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                s_client.stdout or "", re.DOTALL,
+            )
+            if match:
+                x509 = self._run(
+                    ["openssl", "x509", "-noout", "-ext", "subjectAltName"],
+                    input_data=match.group(0),
+                    capture=True, check=False, timeout=15,
+                )
+                dns_match = re.search(
+                    r"DNS:([A-Za-z0-9*_.-]+)", x509.stdout or ""
+                )
+                if dns_match:
+                    dns = dns_match.group(1)
+        except Exception as exc:
+            logger.warning(
+                "Could not discover a DNS SAN for %s: %s", key, exc
+            )
+        cache[key] = dns
+        return dns
+
+    def _inject_upstream_tls_verify(self, content: str) -> str:
+        """Verify TLS on the nginx -> OpenStack upstream leg.
+
+        nginx does not verify proxied-server certificates by default, so the
+        browser-facing service pages would accept any certificate. When an
+        effective `cafile` is available (explicit config, or the relation CA
+        that already passed the all-HTTPS-endpoints probe), every https
+        upstream location gets `proxy_ssl_verify on` plus the trusted CA.
+
+        IP-literal upstreams additionally get `proxy_ssl_name <DNS SAN>`: this
+        nginx version verifies DNS names only, so the certificate's own DNS
+        SAN is used (discovered with openssl at configure time). Locations
+        whose certificate exposes no DNS SAN are left unverified and logged.
+        Plain-http upstreams (e.g. heat) are untouched. Idempotent; no-op when
+        no verified CA is available.
+        """
+        if self._certificates_data() is None:
+            return content
+        identity = self._effective_identity()
+        cafile = self._effective_cafile(
+            identity, self._certificates_data()
+        )
+        if not cafile:
+            logger.info(
+                "no verified CA available; nginx upstream TLS verification "
+                "stays disabled"
+            )
+            return content
+        marker = "# skyline-charm: upstream tls verify"
+        if marker in content:
+            return content
+        anchor = "proxy_ssl_server_name on;"
+        pass_re = re.compile(r"proxy_pass\s+https://([^/;\s]+)")
+        dns_cache = {}
+        lines = []
+        current = None
+        injected = skipped = 0
+        for line in content.splitlines():
+            lines.append(line)
+            match = pass_re.search(line)
+            if match:
+                current = match.group(1)
+                continue
+            if line.strip() != anchor:
+                continue
+            indent = line[: len(line) - len(line.lstrip())]
+            if current:
+                host, _, port = current.partition(":")
+                if _is_ip_address(host):
+                    dns = self._upstream_dns_name(
+                        host, port or "443", dns_cache
+                    )
+                    if not dns:
+                        logger.warning(
+                            "no DNS SAN in the certificate of https://%s — "
+                            "skipping upstream TLS verification for that "
+                            "location", current,
+                        )
+                        skipped += 1
+                        continue
+                    lines.append(f"{indent}proxy_ssl_name {dns};")
+            lines.append(f"{indent}{marker}")
+            lines.append(f"{indent}proxy_ssl_verify on;")
+            lines.append(
+                f"{indent}proxy_ssl_trusted_certificate {cafile};"
+            )
+            lines.append(f"{indent}proxy_ssl_verify_depth 2;")
+            injected += 1
+        if not injected and not skipped:
+            logger.warning(
+                "nginx upstream TLS verification not injected: no https "
+                "upstream anchors found"
+            )
+            return content
+        logger.info(
+            "Injected upstream TLS verification (%d location(s), %d skipped, "
+            "CA %s)", injected, skipped, cafile,
+        )
+        result = "\n".join(lines)
+        if content.endswith("\n"):
+            result += "\n"
+        return result
 
     def _configure(self):
         error = self._missing_required_config()

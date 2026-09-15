@@ -134,12 +134,13 @@ options:
     type: string
     default: ""
     description: |
-      Path to a CA bundle used to verify outbound TLS to OpenStack services.
-      When empty (default), the CA delivered by the `certificates` relation is
-      used automatically — but only if it validates every HTTPS endpoint in
-      the Keystone catalog; otherwise verification stays off (the pre-TLS
-      behaviour) and the failures are logged. Plain-HTTP endpoints (e.g.
-      heat) are never affected by TLS verification.
+      Path to a CA bundle used to verify outbound TLS to OpenStack services
+      (both the apiserver sessions and nginx's proxy_ssl_verify upstream
+      leg). When empty (default), the CA delivered by the `certificates`
+      relation is used automatically — but only if it validates every HTTPS
+      endpoint in the Keystone catalog; otherwise verification stays off
+      (the pre-TLS behaviour) and the failures are logged. Plain-HTTP
+      endpoints (e.g. heat) are never affected by TLS verification.
 
   # ── Skyline application ───────────────────────────────────────────────
   debug:

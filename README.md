@@ -44,10 +44,12 @@ design.
 - **TLS on the units (`certificates` relation):** the vault PKI issues a
   per-unit certificate (SAN = unit hostname + ingress IP); nginx serves HTTPS
   on `tls-port` (default `443`) and keeps `listen-port` (default `9999`) as a
-  301 redirect. Outbound TLS to OpenStack is verified with the relation CA
-  (`cafile`) after a probe confirms every HTTPS endpoint in the catalog
-  validates; plain-HTTP endpoints (e.g. heat) are never affected. Inspect with
-  the `check-tls` action — see [TLS on the units](#tls-on-the-units)
+  301 redirect. Outbound TLS to OpenStack is verified on **both** legs — the
+  apiserver sessions via `cafile` and nginx's `proxy_ssl_verify` upstream
+  leg — with the relation CA, after a probe confirms every HTTPS endpoint in
+  the catalog validates; plain-HTTP endpoints (e.g. heat) are never affected.
+  Inspect with the `check-tls` action — see
+  [TLS on the units](#tls-on-the-units)
 - Uniform session `secret_key` shared across units over `skyline-peers`
 - Prometheus monitoring — set `prometheus-endpoint` and the console Monitor
   pages are populated. Each unit queries the same Prometheus API
@@ -72,7 +74,7 @@ design.
   (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`, `patch-frontend`, `patch-kubeconfig`, `check-tls`
-- **Unit tests:** 142 tests covering helpers, nginx injection, JS patching,
+- **Unit tests:** 149 tests covering helpers, nginx injection, JS patching,
   actions, lifecycle events, relations and TLS (run with `py -3 -m pytest tests/`)
 
 **Remaining / planned**
@@ -80,9 +82,6 @@ design.
 - VIP TLS termination uses operator-provided certificates (how-to:
   [TLS termination at the VIP](#tls-termination-at-the-vip)); the units
   themselves already terminate TLS via the `certificates` relation.
-- nginx → OpenStack-service upstream verification (`proxy_ssl_verify`) is not
-  enabled yet; the apiserver and all catalog queries are already verified via
-  `cafile` (see [TLS on the units](#tls-on-the-units)).
 
 ---
 
@@ -117,7 +116,7 @@ skyline-charm/
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
 │   │   offline_proof.sh, check_db.sh
 │   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
-├── tests/                             # unit tests (offline, 142 tests)
+├── tests/                             # unit tests (offline, 149 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
 │   └── test_*.py                      #   action/lifecycle/relation/nginx/patch/config/tls tests
@@ -192,6 +191,16 @@ juju integrate skyline:certificates vault:certificates
   failures are logged. Run `juju run skyline/<unit> check-tls` for a report.
   Plain-HTTP endpoints (e.g. heat) are never affected — `cafile` only applies
   to `https://` URLs.
+- **nginx upstream verification:** the browser's service pages are proxied by
+  nginx to the real endpoints, and nginx does not verify upstreams by default.
+  When a verified CA is available, the generated config gets
+  `proxy_ssl_verify on` + `proxy_ssl_trusted_certificate <CA>` in every
+  `https` upstream location, so that leg is verified too. Because this nginx
+  version (1.18) verifies DNS names only and cannot match IP SANs, IP-literal
+  upstreams additionally get `proxy_ssl_name <DNS SAN>` taken from the
+  endpoint's own certificate; locations whose certificate exposes no DNS SAN
+  are left unverified and logged. Plain-http upstreams (heat) are untouched
+  and both layers share the same probe guard.
 - Certificates are renewed by the provider re-publishing over the relation;
   the charm rewrites the files and reloads nginx only when the material
   actually changes.
@@ -1170,7 +1179,9 @@ juju run skyline/0 check-tls
 ```
 
 Fix the reported endpoints (wrong CA, missing IP SANs) or set an explicit
-`cafile` bundle that covers them.
+`cafile` bundle that covers them. The same CA also drives nginx's
+`proxy_ssl_verify` upstream leg — if a service page returns 502 while login
+works, check that service's endpoint in the `check-tls` output.
 
 **Removing Skyline (or scaling in) can wedge `mysql-innodb-cluster` / `vault`.**
 Every skyline unit carries a co-located `mysql-router` subordinate, so removing
@@ -1257,6 +1268,8 @@ config-changed  (fired automatically after install)
   ├─ GENERATE nginx.conf from the keystone catalog + inject GET /healthz
   │    (fallback to templates/nginx.conf.j2 if the generator fails)
   ├─ when TLS is active: inject the 443 ssl listener and the 9999 301 redirect
+  ├─ when a verified CA is available: inject proxy_ssl_verify/CA into every
+  │    https upstream location (nginx -> OpenStack leg)
   ├─ systemctl daemon-reload
   ├─ make db_sync  (Alembic)
   │    ├─ cluster path, non-leader unit: wait for the leader's schema first
@@ -1306,7 +1319,7 @@ on each one (e.g. `skyline/0`, `skyline/1`, ...).
 
 ## Testing
 
-142 local unit tests cover the charm's logic layer — helper functions, nginx
+149 local unit tests cover the charm's logic layer — helper functions, nginx
 injection, JS bundle patching, action handlers, lifecycle events, relations
 and TLS handling. They run entirely offline (no Juju/MAAS required) and mock
 all subprocess calls.
