@@ -428,19 +428,24 @@ relations shown in 5a — never scale with per-unit local MariaDB.
 juju status --watch 5s
 ```
 
-Expected progress:
+Expected progress (on the identity-credentials/router path; the local-DB path additionally shows the two lines marked *local DB*):
 ```
+maintenance: Starting Skyline installation
 maintenance: Installing system packages
-maintenance: Installing MariaDB
+maintenance: Installing MariaDB              # local-DB path only
 maintenance: Creating Python virtualenv
 maintenance: Installing skyline-apiserver (offline bundle)
 maintenance: Installing skyline-console wheel
 maintenance: Software installed; awaiting config
 maintenance: Rendering configuration
+maintenance: Configuring local MariaDB       # local-DB path only
 maintenance: Generating nginx config from keystone catalog
 maintenance: Running database migration (db_sync)
+waiting:     Waiting for leader to migrate database schema   # non-leader units only
 active:      Unit is ready
 ```
+
+> Waiting/blocked statuses during relation bring-up (Keystone/router/TLS credentials, missing config) are listed in [Step 5a](#5a--via-the-identity-credentials-relation-recommended).
 
 ## Step 7 — Access the dashboard
 
