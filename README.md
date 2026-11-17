@@ -2,8 +2,15 @@
 
 [![CI](https://github.com/Jarru01/skyline-charm/actions/workflows/ci.yaml/badge.svg)](https://github.com/Jarru01/skyline-charm/actions/workflows/ci.yaml)
 
-Deploys **OpenStack Skyline Dashboard** (stable/2024.2) inside an LXD
-container:
+A Juju machine charm for the **OpenStack Skyline dashboard** (stable/2024.2)
+on Charmed OpenStack (MAAS + Juju machine deployments). Built as part of a
+diploma thesis on Kubernetes-as-a-Service with OpenStack Magnum and tested on
+Juju 3.6 / MAAS / Ubuntu 22.04. Highlights: fully offline install, HA through
+`mysql-innodb-cluster` + an HAProxy/Keepalived VIP, TLS via Vault's
+`certificates` relation, and a working Magnum **Download Kubeconfig** action.
+The charm is built locally with `charmcraft pack` (not published to Charmhub).
+
+Each unit runs inside an LXD container:
 
 | Component | Detail |
 |---|---|
@@ -71,7 +78,7 @@ design.
   (`interface: http`, declared in `charmcraft.yaml`). HAProxy consumes this via
   its `reverseproxy` side and discovers/removes backends automatically — no
   static server lists anywhere
-  (see [Access layer](#access-layer-phase-2-haproxy--keepalived-vip))
+  (see [Access layer](#access-layer-haproxy--keepalived-vip))
 - Actions: `db-sync`, `show-config`, `restart-services`, `regenerate-nginx`,
   `get-static-path`, `patch-frontend`, `patch-kubeconfig`, `check-tls`
 - **Unit tests:** 149 tests covering helpers, nginx injection, JS patching,
@@ -110,7 +117,7 @@ skyline-charm/
 │   └── wheels/                        # ← complete offline pip bundle
 │       ├── requirements.lock          #   pinned lockfile (pip freeze)
 │       ├── skyline_apiserver-*.whl    #   apiserver wheel (PBR_VERSION=2024.2)
-│       └── 99 pinned wheels + lockfile>
+│       └── *.whl                      #   98 further pinned dependency wheels
 ├── .tmp/                              # dev-only scripts (git-ignored, never packed)
 │   ├── build_wheels.sh                #   regenerate files/wheels
 │   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
@@ -392,8 +399,8 @@ Notes:
     exactly **one** unit runs the real Alembic migration, the rest follow
     with a no-op, so parallel cold starts can never race DDL
 
-For a single-unit lab deployment, drop `-n 3 --to ...` and the two
-`skyline-mysql-router` lines; the charm then manages a local MariaDB (see 5b).
+For a single-unit lab deployment, drop `-n 3 --to ...`, the `mysql-router`
+deploy and its three `integrate` lines; the charm then manages a local MariaDB (see 5b).
 
 ### 5b — With explicit credentials (fallback)
 
@@ -478,10 +485,10 @@ service-url updates.
 | Key | Default | Description |
 |---|---|---|
 | `keystone-url` | *(required)* | Full Keystone v3 URL (`/v3/` is appended if missing). Not needed when related to keystone via `identity-credentials` |
-| `system-user-password` | *(required)* | Password of the `skyline` OS user. Not needed when related via `identity-credentials` |
+| `system-user-password` | `""` | Password of the `skyline` OpenStack service user. Required unless `identity-credentials` is related |
 | `database-password` | `""` | Local MariaDB password (auto-generated if empty) |
 | `default-region` | `RegionOne` | OpenStack region |
-| `system-user-name` | `skyline` | Name of the OS service user |
+| `system-user-name` | `skyline` | Name of the OpenStack service user |
 | `system-user-domain` | `admin_domain` | Domain of the service user |
 | `system-project` | `admin` | Admin project name |
 | `system-project-domain` | `admin_domain` | Domain of the admin project |
@@ -651,6 +658,11 @@ config time (idempotent — safe to run repeatedly):
    > HTTP 502 `container-infra endpoint not found in catalog`. Clouds that
    > publish a public Magnum endpoint (the common case) are unaffected. Check
    > with `openstack endpoint list --service container-infra -c Interface -c URL`.
+   >
+   > **Known limitation:** the injected endpoint currently calls Keystone and
+   > Magnum with TLS verification disabled (`verify=False`); it does not yet use
+   > the `cafile` the apiserver itself uses. The generated kubeconfig still
+   > embeds the cluster CA, so kubectl verifies the Kubernetes API normally.
 
 6. **Network topology crash on external-only clouds:** Upstream
    `renderInstanceNode()` indexes `data.subnetNodes` blindly, but
@@ -678,7 +690,7 @@ unit with no router relation uses the charm-managed local MariaDB instead
 
 This is the production path used by every other service in the model: a
 `mysql-router` subordinate is co-located on each skyline unit and fronts a
-`mysql-innodb-cluster`. The app still connects to `127.0.0.1:3306`-inside-its-
+`mysql-innodb-cluster`. The app still connects to `127.0.0.1:3306` inside its
 container, but that socket is now the router, which proxies to the (HA)
 InnoDB Cluster — the cluster auto-provisions the `skyline` database and user.
 
@@ -688,8 +700,8 @@ The cluster needs to exist and be ONLINE, and vault must be able to issue the
 router certificates. If you are starting from scratch:
 
 ```bash
-juju deploy --channel 8.0/stable mysql-innodb-cluster --to lxd:0       # 3 units via -n 3
-juju integrate mysql-innodb-cluster:vault vault:certificates              # router TLS chain
+juju deploy -n 3 --channel 8.0/stable mysql-innodb-cluster --to lxd:0,lxd:1,lxd:2
+juju integrate mysql-innodb-cluster:certificates vault:certificates       # router TLS chain
 # wait until: "Unit is ready: Mode: R/W, Cluster is ONLINE and can tolerate up to ONE failure."
 ```
 
@@ -811,7 +823,7 @@ Two prerequisites are handled by the charm but worth verifying after scaling:
 2. **One uniform `secret_key`** — the leader publishes it over
    `skyline-peers`; check each unit with `juju run skyline/0 show-config`.
 
-## Access layer (Phase 2): HAProxy + Keepalived VIP
+## Access layer: HAProxy + Keepalived VIP
 
 The skyline units sit behind an HAProxy access layer with a Keepalived-managed
 VIP, fully Juju-configured (no manual `haproxy.cfg` edits):
@@ -957,8 +969,8 @@ Measured with a client loop hitting `http://192.0.2.200/healthz` every ~0.27 s
 | T4 | Original master returns (`start keepalived`) | VIP returned to haproxy/3 (preempt); **0/96** failures during fail-back |
 | T5 | Non-VIP haproxy unit outage (`stop haproxy` on haproxy/4) | Peer tier marked it DOWN; VIP unaffected; **0** failures / 80 requests served; UP again after restart |
 
-All acceptance criteria from the reference design are met; failover time is
-well under the ~9 s observed there.
+VIP failover interrupted service for ~1.5 s (one dropped request);
+backend-outage detection is bounded by `fall 3 × inter 10s`.
 
 ---
 
@@ -1102,9 +1114,10 @@ juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
 
 **Units stuck in MaintenanceStatus "Generating nginx config from keystone catalog".**
 The nginx generator subprocess hung (e.g. keystone unreachable) and the Juju
-hook blocked. Charm ≥ rev 57 has a 120-second timeout on the generator — it
-falls back to the static template instead of blocking. To recover on older
-revs, refresh the charm and the `upgrade-charm` hook re-runs `_configure()`:
+hook blocked. The charm applies a 120-second timeout to the generator and
+falls back to the static template instead of blocking. If a unit built from an
+older commit is stuck, refresh it — the `upgrade-charm` hook re-runs
+`_configure()`:
 ```bash
 juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
 ```
@@ -1334,6 +1347,6 @@ py -3 -m pip install "ops>=2.9.0" jinja2 pytest   # one-time
 py -3 -m pytest tests/ -v
 ```
 
-Tests do **not** verify real filesystem paths, template rendering, or
-deployed-cluster behaviour. For full confidence, deploy to a test model and
+Tests do **not** exercise a real unit (apt, systemd, MariaDB/MySQL,
+`nginx -t`) or deployed-cluster behaviour. For full confidence, deploy to a test model and
 run the smoke checks from the sections above.
