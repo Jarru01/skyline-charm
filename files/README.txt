@@ -1,4 +1,4 @@
-Place the pre-built bundled artifacts here before running charmcraft pack.
+This directory holds the bundled artifacts packed into the charm.
 
 - wheels/                      the complete offline wheel bundle:
   - skyline_apiserver-*.whl    prebuilt skyline-apiserver wheel (built with
@@ -6,7 +6,7 @@ Place the pre-built bundled artifacts here before running charmcraft pack.
   - pip/setuptools/wheel + every runtime dependency pinned in
     wheels/requirements.lock
   The charm installs the whole venv with --no-index --find-links wheels/
-  (fully offline; see the regeneration script .tmp/build_wheels.sh in the repo).
+  (fully offline).
 - skyline_console-*.whl        the pre-built skyline-console wheel (lives at
   files/ top level, NOT inside wheels/; the charm installs it with
   --force-reinstall using wheels/ as the find-links source)
@@ -16,11 +16,13 @@ Place the pre-built bundled artifacts here before running charmcraft pack.
 
 Regenerating the wheel bundle
 -----------------------------
-1. Validate a reference venv (/opt/skyline-venv) by building/installing
-   skyline-apiserver from the bundled tarball and running `make db_sync`.
-2. `.tmp/build_wheels.sh` (WSL) freezes the venv, builds the apiserver wheel
-   and downloads every dependency as a wheel into wheels/.
-3. Prove it offline with `.tmp/full_proof.sh`: fresh venv, PIP_NO_INDEX=1,
-   `pip check` clean, `make db_sync` idempotent.
+1. Validate a reference venv by building/installing skyline-apiserver from
+   the bundled tarball and running `make db_sync`.
+2. `pip freeze` the venv into wheels/requirements.lock, build the apiserver
+   wheel from the tarball source (`PBR_VERSION=2024.2 pip wheel --no-deps .`)
+   and `pip download --no-deps` every other locked package, plus
+   pip/setuptools/wheel, into wheels/.
+3. Prove it offline: a fresh venv with PIP_NO_INDEX=1 installs cleanly,
+   `pip check` passes and `make db_sync` is idempotent.
 
 See the main README.md for build instructions.

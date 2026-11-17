@@ -102,7 +102,8 @@ skyline-charm/
 ├── requirements.txt                   # Charm Python deps: ops, jinja2
 ├── .charmignore                       # Files excluded from the packed charm
 ├── .gitattributes                     # Forces LF line endings on tracked files
-├── .gitignore                         # Local dev exclusions (.tmp/, *.charm, ...)
+├── .gitignore                         # Local dev exclusions (*.charm, ...)
+├── .github/workflows/                 # ci.yaml (unit tests), pack.yaml (charmcraft pack)
 ├── src/
 │   └── charm.py                       # Main ops-framework charm
 ├── templates/
@@ -118,11 +119,6 @@ skyline-charm/
 │       ├── requirements.lock          #   pinned lockfile (pip freeze)
 │       ├── skyline_apiserver-*.whl    #   apiserver wheel (PBR_VERSION=2024.2)
 │       └── *.whl                      #   98 further pinned dependency wheels
-├── .tmp/                              # dev-only scripts (git-ignored, never packed)
-│   ├── build_wheels.sh                #   regenerate files/wheels
-│   ├── full_proof.sh, exact_test.sh,  #   offline-install proofs
-│   │   offline_proof.sh, check_db.sh
-│   └── skyline-2024_2-deployment-guide.md  # upstream deployment guide
 ├── tests/                             # unit tests (offline, 149 tests)
 │   ├── conftest.py                    #   harness fixtures
 │   ├── helpers.py                     #   shared test utilities
@@ -269,9 +265,12 @@ tar czf skyline-apiserver-2024.2.tar.gz skyline-apiserver-2024.2-eol
 ### Offline wheel bundle (files/wheels)
 
 The complete set of wheels the unit installs from (see `files/README.txt` for
-details). Regenerate it with `.tmp/build_wheels.sh` (WSL), then prove it
-offline with `.tmp/full_proof.sh` (fresh venv, `PIP_NO_INDEX=1`, `pip check`
-clean, `make db_sync` idempotent).
+details). To regenerate it: in a validated venv, `pip freeze` into
+`requirements.lock`, build the apiserver wheel from the bundled tarball
+(`PBR_VERSION=2024.2 pip wheel --no-deps .`), and `pip download --no-deps` every
+other locked package (plus `pip`/`setuptools`/`wheel`) into `files/wheels/`.
+Then prove it offline: a fresh venv with `PIP_NO_INDEX=1` installs cleanly,
+`pip check` passes and `make db_sync` is idempotent.
 
 ## Step 2 — Place the artifacts in the charm
 
@@ -1238,7 +1237,7 @@ Build the new console wheel / apiserver tarball, update the files, and refresh:
 ```bash
 cd skyline-charm/
 # replace files/skyline_console-*.whl, files/skyline-apiserver-*.tar.gz,
-# and (if needed) regenerate files/wheels with .tmp/build_wheels.sh
+# and (if needed) regenerate files/wheels (see "Offline wheel bundle")
 charmcraft pack
 juju refresh skyline --path ./skyline_ubuntu-22.04-amd64.charm
 ```
