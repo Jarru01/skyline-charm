@@ -818,7 +818,7 @@ VIP, fully Juju-configured (no manual `haproxy.cfg` edits):
 
 ```bash
 # 0) Reserve the VIP in MAAS first: static reservation in the same subnet /
-#    VLAN as the unit addresses (here 10.11.1.200 on 10.11.0.0/16), so no
+#    VLAN as the unit addresses (here 192.0.2.200 on 192.0.2.0/24 — RFC 5737 example; use your own), so no
 #    other machine can claim it and VRRP can move it freely.
 
 # 1) HAProxy application — spread across machines like skyline
@@ -828,7 +828,7 @@ juju deploy haproxy --channel latest/stable -n 3 \
 
 # 2) Keepalived subordinate on every haproxy unit + the VIP
 juju deploy keepalived --channel latest/stable \
-  --config virtual_ip=10.11.1.200
+  --config virtual_ip=192.0.2.200
 juju integrate keepalived:juju-info haproxy:juju-info
 
 # 3) Backends — each skyline unit publishes address+port over the website
@@ -857,9 +857,9 @@ juju config haproxy services='[{"service_name": "skyline", "service_host": "0.0.
 Verify:
 
 ```bash
-curl -s  -o /dev/null -w '%{http_code}\n' http://10.11.1.200/healthz   # 200 (plain mode)
-curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/healthz  # 200 (TLS at the VIP)
-curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/         # 200 (TLS at the VIP)
+curl -s  -o /dev/null -w '%{http_code}\n' http://192.0.2.200/healthz   # 200 (plain mode)
+curl -sk -o /dev/null -w '%{http_code}\n' https://192.0.2.200/healthz  # 200 (TLS at the VIP)
+curl -sk -o /dev/null -w '%{http_code}\n' https://192.0.2.200/         # 200 (TLS at the VIP)
 
 # per-unit backend status (stats are localhost-only by default):
 juju ssh haproxy/0
@@ -926,7 +926,7 @@ Use this when clients must reach the dashboard over HTTPS:
 Verify (both scenarios):
 
 ```bash
-curl -sk -o /dev/null -w '%{http_code}\n' https://10.11.1.200/healthz   # 200
+curl -sk -o /dev/null -w '%{http_code}\n' https://192.0.2.200/healthz   # 200
 ```
 
 Notes:
@@ -946,7 +946,7 @@ Notes:
 
 ### Failover test results (T1–T5)
 
-Measured with a client loop hitting `http://10.11.1.200/healthz` every ~0.27 s
+Measured with a client loop hitting `http://192.0.2.200/healthz` every ~0.27 s
 (plain-HTTP path; the failover mechanism is unchanged with TLS on the units).
 
 | Test | Scenario | Result |
